@@ -1284,6 +1284,15 @@ pub(crate) fn host_waits(this: This) -> bool {
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
+/// Whether a texture's host copy is made without the texture's lock held
+/// ([`hosted`]). On by default; `VICTORY_TEXTURE_UNLOCKED=0` holds it, as
+/// before.
+#[cfg(windows)]
+fn texture_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
 /// The host side of title texture `this`: made now if it is not there and
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
@@ -1298,6 +1307,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        // Made without the texture's lock: a slot written with a view of
+        // it asks `host_waits` under its heap's lock.
+        let held = (!texture_unlocked()).then_some(made);
         let clear = r
             .host
             .clear
@@ -1321,6 +1333,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        made = held.unwrap_or_else(|| r.host.made.lock().unwrap_or_else(|e| e.into_inner()));
+        if made.is_some() {
+            // Another thread made it meanwhile: this one was handed to nothing.
+            r.host.used.store(crate::host::moment(), Relaxed);
+            return made.clone();
+        }
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
