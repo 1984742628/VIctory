@@ -1504,6 +1504,9 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// Where small ranges come down with their submission ([`fetch_with`]):
+    /// PC memory of [`FETCH_WITH`] bytes, mapped.
+    with: Option<(ID3D12Resource, usize)>,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -1582,6 +1585,20 @@ fn rehash_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
 }
 
+/// Whether a submission that is waited for brings the pieces of its small
+/// compared ranges down itself, behind its compare, flagged or not: the
+/// fetch of the flagged ones was a second submission and a second wait for
+/// the card (8 a frame, 35 ms). Ranges of more than [`FETCH_WITH_PIECES`]
+/// pieces, and what does not fit in [`FETCH_WITH`] bytes, are fetched by
+/// flag as before. `VICTORY_CARD_FETCH_WITH=0`: all of them are.
+fn fetch_with() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FETCH_WITH").is_none_or(|v| v != "0"))
+}
+
+const FETCH_WITH: u64 = 16 << 20;
+const FETCH_WITH_PIECES: u32 = 16;
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -1610,6 +1627,9 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+    /// Where its pieces, one after the other, come down with the
+    /// submission (`CardWork::with`), if they do ([`fetch_with`]).
+    with: Option<u64>,
 }
 
 /// What a submission does for copies in the card's memory.
@@ -3027,6 +3047,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                with: None,
                 taken: 0,
                 out: 0,
             })
@@ -3042,8 +3063,8 @@ impl Host {
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
-    /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    /// `relay`). `waited`: it is waited for at once, alone ([`fetch_with`]).
+    fn card_before(&self, runs: &[&HostList], flown: bool, waited: bool) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3176,6 +3197,11 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
+        if waited && fetch_with() && work.with.is_none() && !declared.is_empty() {
+            work.with = self.shared_buffer(FETCH_WITH).map(|(buffer, data)| (buffer, data as usize));
+        }
+        let with_most = if waited && fetch_with() && work.with.is_some() { FETCH_WITH } else { 0 };
+        let mut with_taken = 0u64;
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -3192,12 +3218,18 @@ impl Host {
                     continue;
                 };
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let bytes = u64::from(span.pieces) << 16;
+                let with = (compared && span.pieces <= FETCH_WITH_PIECES && with_taken + bytes <= with_most).then(|| {
+                    with_taken += bytes;
+                    with_taken - bytes
+                });
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
                     at,
                     compared,
+                    with,
                 });
                 if compared {
                     at += span.pieces;
@@ -3240,6 +3272,21 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Small ranges come down here, whole ([`fetch_with`]).
+                    if let Some((fetched, _)) = &work.with {
+                        for r in &plan.ranges {
+                            let Some(mut at) = r.with else {
+                                continue;
+                            };
+                            for p in 0..r.span.pieces {
+                                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                                if lo < hi {
+                                    list.CopyBufferRegion(fetched, at, &r.shadow.buffer, lo as u64, (hi - lo) as u64);
+                                    at += (hi - lo) as u64;
+                                }
+                            }
+                        }
                     }
                     list.Close()?;
                     list.cast()
@@ -3548,7 +3595,8 @@ impl Host {
     /// After a submission ran, for copies in the card's memory: the pieces
     /// of the declared ranges that the compare found differing (all of a
     /// range it did not compare) are fetched, with one more wait for the
-    /// card, and what shaders wrote in them goes into title memory.
+    /// card unless they came down with the submission ([`fetch_with`]),
+    /// and what shaders wrote in them goes into title memory.
     /// `submitted` is the last value signalled on the fence. `seen` holds
     /// the pieces fetched already since the card was last waited for
     /// (several submissions settled together name the same ones).
@@ -3572,15 +3620,30 @@ impl Host {
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        // The pieces whose bytes are down: the range, the offsets in its
+        // copy, and where the bytes are.
+        let mut ready: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let with = work.with.as_ref().map(|w| w.1);
         for (i, r) in plan.ranges.iter().enumerate() {
+            // Where the next piece came down with the submission, if it did.
+            let mut down = r.with.zip(with).map(|(at, data)| data + at as usize);
             for p in 0..r.span.pieces {
+                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                let came = down;
+                if let Some(at) = &mut down {
+                    *at += hi.saturating_sub(lo);
+                }
                 if r.compared && differs[(r.at + p) as usize] == 0 {
                     continue;
                 }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+                    match came {
+                        Some(at) => ready.push((i, lo, hi, at)),
+                        None => {
+                            pieces.push((i, lo, hi, total));
+                            total += (hi - lo) as u64;
+                        }
+                    }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -3628,17 +3691,19 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
+            ready.extend(pieces.iter().map(|&(i, lo, hi, at)| (i, lo, hi, *data + at as usize)));
+        }
+        if !ready.is_empty() {
+            if wide_merge() && ready.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
-                let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
-                let each = pieces.len().div_ceil(8);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                let each = ready.len().div_ceil(8);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = ready
                     .chunks(each)
                     .map(|chunk| {
-                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
+                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, usize)> =
                             chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
                         let counts = counts.clone();
                         Box::new(move || {
@@ -3647,7 +3712,7 @@ impl Host {
                                 // SAFETY: the mapping of the fetched bytes;
                                 // the copy into it has run, and the caller
                                 // waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
+                                let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
                                 counts[i].fetch_add(shadow.card_merge(lo, gpu, &mut title), Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
@@ -3659,10 +3724,10 @@ impl Host {
                 }
             } else {
                 let mut title = Vec::new();
-                for &(i, lo, hi, at) in &pieces {
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run.
-                    let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
+                for &(i, lo, hi, at) in &ready {
+                    // SAFETY: the mapping of the fetched bytes; the copy
+                    // into it has run.
+                    let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
                     written[i] += plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                 }
             }
@@ -4050,7 +4115,7 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, !late);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
