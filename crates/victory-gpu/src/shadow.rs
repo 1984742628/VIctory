@@ -1949,20 +1949,42 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    self.put_back(start + at, title);
                     written += n;
                 }
             }
-            // Our write shows as a title write at the copy's next refresh,
-            // which copies those pages once more (some dozens of MB a
-            // frame). Asking about the whole range here, to note them
-            // current, cost more: 19-31 askings a frame over 110-174 MB of
-            // view memory, each a walk of its guards.
+            // Where `put_back` could not leave the page guarded, our write
+            // shows as a title write at the copy's next refresh, which
+            // copies those pages once more. Asking about the whole range
+            // here, to note them current, cost more: 19-31 askings a frame
+            // over 110-174 MB of view memory, each a walk of its guards.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
+    }
+
+    /// Writes `bytes`, which the copy holds too, to title memory at `at`
+    /// (what shaders wrote, merged). Where the page stays guarded
+    /// (`crate::watch::write_clean`) and the copy was current there, it
+    /// still is: the next refresh does not take the page for our write.
+    fn put_back(&self, at: usize, bytes: &[u8]) {
+        match crate::watch::write_clean(at, bytes, (self.data, self.start as usize, self.len as usize)) {
+            Some(Some((before, now))) => {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(took) = copied.get_mut(at / PAGE - self.start as usize / PAGE)
+                    && *took != 0
+                    && before <= *took
+                {
+                    *took = now;
+                }
+            }
+            Some(None) => {}
+            None => {
+                crate::watch::writing(at, bytes.len());
+                crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+            }
+        }
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -2566,8 +2588,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.put_back(start + at, title);
                 written = n;
             }
         } else {
