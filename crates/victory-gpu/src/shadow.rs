@@ -2856,7 +2856,9 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 /// A title buffer exists at `start` (`len` bytes); `written`: shaders may
 /// write it (made for unordered access).
 pub(crate) fn register(resource: usize, start: u64, len: u64, written: bool) {
-    buffers().insert(
+    let mut map = buffers();
+    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -2864,6 +2866,22 @@ pub(crate) fn register(resource: usize, start: u64, len: u64, written: bool) {
             shadow: None,
         },
     );
+}
+
+/// The longest title buffer registered so far (kept after its release): one
+/// starting further below an address cannot hold it (Marvisak/VIctory #402).
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// The title buffers starting at most [`MAX_SPAN`] below `end` and at or
+/// below `address`, nearest first: a heap's buffer can sit behind any
+/// number of the smaller ones placed in it.
+fn starting_below(
+    map: &BTreeMap<(u64, usize), Entry>,
+    address: u64,
+    end: u64,
+) -> impl DoubleEndedIterator<Item = (&(u64, usize), &Entry)> {
+    let lowest = end.saturating_sub(MAX_SPAN.load(Ordering::Relaxed)).min(address);
+    map.range((lowest, 0)..=(address, usize::MAX)).rev()
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -2875,10 +2893,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
+    starting_below(&buffers(), address, address + 1)
         .find(|(_, e)| e.end > address)
         .map(|(k, e)| (k.0, e.end - k.0))
 }
@@ -2900,9 +2915,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
+        // As `lookup` finds a buffer: those starting within the longest below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        let lowest = end.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+        for (_, entry) in map.range_mut((lowest, 0)..(end, 0)).rev() {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
@@ -2960,12 +2976,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = starting_below(&map, address, end).find(|(_, e)| e.end >= end).map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
         return loose(address, end, len <= 1, any);
