@@ -575,15 +575,16 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
-        // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
-        // driver compiling shaders again on the "D3D Background Thread"s,
-        // for minutes after pipelines were made or loaded) is switched off.
-        // An experiment: while those threads ran, the same shot took
-        // 1,000-1,200 ms a frame, and 830-950 ms from the moment they
-        // stopped (run 54, 08:32:01 to 08:32:06). Left as it is by default:
+        // The runtime's background work (the driver compiling shaders again
+        // on the "D3D Background Thread"s, for minutes after pipelines were
+        // made or loaded) is switched off. While those threads ran, the
+        // same shot took 1,000-1,200 ms a frame, and 830-950 ms from the
+        // moment they stopped (run 54, 08:32:01 to 08:32:06); with the
+        // pipelines loaded from the library they ran for 170 s after the
+        // load. `VICTORY_D3D12_BACKGROUND=1` leaves it on, as before:
         // whether the card is slower with the shaders it then keeps is not
         // known.
-        if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0")
+        if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_none_or(|v| v == "0")
             && let Ok(device6) = device.cast::<ID3D12Device6>()
         {
             let set = device6.SetBackgroundProcessingMode(
@@ -592,7 +593,7 @@ fn create() -> windows::core::Result<Host> {
                 None,
                 None,
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
+            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=1 leaves it on)");
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32

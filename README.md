@@ -65,7 +65,9 @@ off with `=0`: `VICTORY_RELAY` (2; it sends submissions ahead as
 `VICTORY_LATE_WAIT=3`), `VICTORY_WIDE_BACK`, `VICTORY_WIDE_MERGE`,
 `VICTORY_WIDE_REFRESH`, `VICTORY_CARD_REHASH_RUNS`, `VICTORY_JOIN_COPIES`,
 `VICTORY_TEXTURE_NO_WAIT`, `VICTORY_CARD_BUFFERS_MIN_MB` (1) and
-`VICTORY_CARD_BUFFERS_MB` (1024; `=0` gives the earlier 16 and 512). Off by
+`VICTORY_CARD_BUFFERS_MB` (1024; `=0` gives the earlier 16 and 512). The
+driver's background shader re-optimising is switched off;
+`VICTORY_D3D12_BACKGROUND=1` leaves it on. Off by
 default: `VICTORY_INPLACE` (do not set it to 2 with the relay on),
 `VICTORY_BVH_BUILDER`, `VICTORY_LARGE_PAGES=1` (large pages for the
 emulator's own snapshot memory; grant your account "Lock pages in memory" in
