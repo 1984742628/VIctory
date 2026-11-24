@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+[build]
+# The README already requires AVX2.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
