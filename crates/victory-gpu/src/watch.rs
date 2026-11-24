@@ -247,6 +247,15 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // A block we guard is view memory, never write-watched: the kernel
+    // would say no, once per submission and range, and again for each half.
+    // `VICTORY_SKIP_VIEW_ASKS=0` asks it, as before.
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SKIP.get_or_init(|| std::env::var_os("VICTORY_SKIP_VIEW_ASKS").is_none_or(|v| v != "0"))
+        && guards().protected.range(first..last).next().is_some()
+    {
+        return false;
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
