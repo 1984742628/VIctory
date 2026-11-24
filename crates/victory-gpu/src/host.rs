@@ -159,7 +159,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        reap(object);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -182,7 +182,31 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done);
+}
+
+/// Drops `object` on a thread of its own: releasing host objects (memory
+/// given back to the system, the driver's own locks) was time under the
+/// submission lock. The caller knows no submission uses it any more.
+/// `VICTORY_REAPER=0`: dropped here, as before.
+pub(crate) fn reap<T: 'static>(object: T) {
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Retired>>> = OnceLock::new();
+    let reaper = REAPER.get_or_init(|| {
+        if std::env::var_os("VICTORY_REAPER").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (sender, dead) = std::sync::mpsc::channel::<Retired>();
+        std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || dead.into_iter().for_each(drop))
+            .ok()
+            .map(|_| sender)
+    });
+    let dead = Retired(Box::new(object));
+    // Without the thread the object is dropped here (a failed send hands it back).
+    if let Some(reaper) = reaper {
+        let _ = reaper.send(dead);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -1419,7 +1443,9 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         }
     }
     // Freed outside the lock.
-    drop(freed);
+    if !freed.is_empty() {
+        reap(freed);
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -4443,9 +4469,12 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // What the list held for its commands: upload buffers, host objects, texture copies.
+        reap((
+            std::mem::take(&mut *self.deferred()),
+            self.states.lock().unwrap_or_else(|e| e.into_inner()).drain().collect::<Vec<_>>(),
+            self.twins.lock().unwrap_or_else(|e| e.into_inner()).drain().collect::<Vec<_>>(),
+        ));
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
