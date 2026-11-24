@@ -256,6 +256,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn present_compositor_builds_both_pipeline_states() {
+        let Some(host) = host() else {
+            eprintln!("skipping compositor initialization: no D3D12 device");
+            return;
+        };
+        Compositor::new(&host.device, DXGI_FORMAT_R8G8B8A8_UNORM)
+            .expect("create compositor root signature and both pipeline states");
+        eprintln!("PresentX compositor initialized");
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -267,6 +278,7 @@ mod tests {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: the queried DXGI adapter remains live through GetDesc1.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -1470,18 +1482,12 @@ struct Compositor {
 impl Compositor {
     fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
         const SOURCE: &str = r#"
-            #define RS "DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL), \
-                        StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, \
-                            addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, \
-                            visibility=SHADER_VISIBILITY_PIXEL)"
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
-            [RootSignature(RS)]
             void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
                 uv = float2((id << 1) & 2, id & 2);
                 pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
             }
-            [RootSignature(RS)]
             float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
                 return tex.Sample(smp, uv);
             }
@@ -1528,7 +1534,50 @@ impl Compositor {
                 std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
             let ps_bytes =
                 std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, vs_bytes)?;
+            // Wine's D3DCompile does not embed a root signature in the shader blobs.
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                ..Default::default()
+            };
+            let parameter = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MaxAnisotropy: 16,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ..Default::default()
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &parameter,
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                ..Default::default()
+            };
+            let mut signature = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut signature, None)?;
+            let signature = signature.ok_or_else(windows::core::Error::empty)?;
+            let signature = std::slice::from_raw_parts(
+                signature.GetBufferPointer().cast::<u8>(),
+                signature.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, signature)?;
             let make_pso = |blend: bool| -> windows::core::Result<ID3D12PipelineState> {
                 let mut rt_blend = D3D12_RENDER_TARGET_BLEND_DESC {
                     RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
@@ -1739,6 +1788,15 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        self.present_with_compositor(planes, frame, Compositor::new)
+    }
+
+    fn present_with_compositor(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+        create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+    ) -> Option<bool> {
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
@@ -1778,6 +1836,21 @@ impl Host {
                 }
             }
         }
+        // Leave the copy list closed if compositor initialization fails.
+        let compositor = if planes.len() > 1 {
+            if p.compositor.as_ref().is_none_or(|c| c.format != format) {
+                match create_compositor(&self.device, format) {
+                    Ok(c) => p.compositor = Some(c),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no present compositor");
+                        return None;
+                    }
+                }
+            }
+            Some(p.compositor.as_ref()?)
+        } else {
+            None
+        };
         // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1823,16 +1896,7 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                if p.compositor.as_ref().is_none_or(|c| c.format != format) {
-                    match Compositor::new(&self.device, format) {
-                        Ok(c) => p.compositor = Some(c),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "no present compositor");
-                            return None;
-                        }
-                    }
-                }
-                let comp = p.compositor.as_ref()?;
+                let comp = compositor.expect("compositor was created for multiple planes");
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -2293,7 +2357,7 @@ fn pump() {
 }
 
 #[cfg(test)]
-mod tests {
+mod batch {
     use super::Batch;
     use std::sync::Arc;
 
@@ -2362,6 +2426,81 @@ mod tests {
              before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_plane_tests {
+    use super::*;
+
+    #[test]
+    fn compositor_failure_preserves_single_plane_presentation() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX recovery: no D3D12 device");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let make_plane = |width, height, color: &[f32; 4]| {
+            let mut texture = None;
+            // SAFETY: live device, valid render target description, and an open list.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: width,
+                            Height: height,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                list.list
+                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+                texture
+            }
+        };
+        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(32, 32, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        list.close();
+        host.execute(&[&list]);
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        assert!(
+            host.present(&[(&scene, state)], 1).is_some(),
+            "single-plane control"
+        );
+        let mut attempted = false;
+        assert!(
+            host.present_with_compositor(&[(&scene, state), (&overlay, state)], 2, |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            })
+            .is_none(),
+            "injected compositor failure"
+        );
+        assert!(attempted);
+        assert!(
+            host.present(&[(&scene, state)], 3).is_some(),
+            "single-plane presentation after compositor initialization failed"
         );
     }
 }
