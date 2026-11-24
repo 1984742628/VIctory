@@ -609,8 +609,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    // A texture whose console format PC forbids as a render target or UAV
-    // was substituted (`resource::target_format`): views name its host format.
+    // A texture made in another format on this GPU
+    // (`resource::target_format`): views name the format it has.
     if view != own && crate::resource::target_format(view) == own {
         if let Some(format) = format {
             *format = d.Format;
