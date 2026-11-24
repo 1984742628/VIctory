@@ -557,22 +557,39 @@ fn uncommitted_end(block: usize) -> usize {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
+/// notes them written; true if any was guarded. One call to Windows per
+/// run of blocks that touch (`VICTORY_OPEN_RUNS=0`: one per block, as
+/// before).
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    static RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    if blocks.is_empty() {
+        return false;
     }
-    !blocks.is_empty()
+    let runs = blocks.len() > 1 && *RUNS.get_or_init(|| std::env::var_os("VICTORY_OPEN_RUNS").is_none_or(|v| v != "0"));
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    for run in blocks.chunk_by(|a, b| runs && a + 1 == *b) {
+        for block in run {
+            g.protected.remove(block);
+            g.clean.remove(block);
+        }
+        // A run across views fails whole: block by block then, as `protect`.
+        if !set(run[0], run[run.len() - 1] + 1) && run.len() > 1 {
+            for &block in run {
+                set(block, block + 1);
+            }
+        }
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
