@@ -1456,11 +1456,14 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts
+/// them), each thread hashing a kibibyte and the first joining the 64
+/// hashes: `differs` gets a dword per piece, 1 where a byte differs. The
+/// offsets are widened to 16 bytes; buffers are multiples of 64 KiB, and a
+/// piece flagged for a byte just outside the range costs a fetch that
+/// finds nothing. With `NARROW` defined ([`card_compare_source`]): one
+/// thread per piece, as before.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1476,24 +1479,50 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+static const uint4 SEED = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+uint4 mixed(uint4 h, uint4 with) {
+    h = (h ^ with) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
+uint4 hashed(uint lo, uint hi) {
+    uint4 h = SEED;
+    [loop]
+    for (uint at = lo; at < hi; at += 16u) h = mixed(h, now.Load4(at));
+    return h;
+}
+#ifndef NARROW
+groupshared uint4 parts[64];
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
+#ifdef NARROW
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= pieces) return;
-    uint piece = first + id.x;
+    uint index = id.x;
+#else
+void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    uint index = group.x;
+#endif
+    uint piece = first + index;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
-    [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
+#ifdef NARROW
+    uint4 h = hashed(lo, hi);
+#else
+    // This thread's kibibyte; the last one also takes the 16 bytes the
+    // widening may add.
+    uint from = min(lo + thread.x * 1024u, hi);
+    parts[thread.x] = hashed(from, thread.x == 63u ? hi : min(from + 1024u, hi));
+    GroupMemoryBarrierWithGroupSync();
+    if (thread.x != 0u) return;
+    uint4 h = SEED;
+    for (uint i = 0u; i < 64u; i++) h = mixed(h, parts[i]);
+#endif
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + index * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -1502,6 +1531,24 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// Whether each 64 KiB piece is hashed by 64 threads, a kibibyte each (on
+/// by default; `VICTORY_CARD_HASH_WIDE=0`: by one thread, 4,096 loads one
+/// after the other, as before).
+fn card_hash_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// [`CARD_COMPARE`] as it is compiled, wide or not.
+pub(crate) fn card_compare_source(wide: bool) -> String {
+    format!("{}{CARD_COMPARE}", if wide { "" } else { "#define NARROW\n" })
+}
+
+/// The groups of 64 threads a pass over `pieces` pieces takes.
+pub(crate) fn card_groups(pieces: u32, wide: bool) -> u32 {
+    if wide { pieces } else { pieces.div_ceil(64) }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -2920,12 +2967,13 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let source = card_compare_source(card_hash_wide());
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3091,7 +3139,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_groups(run.pieces, card_hash_wide()), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3176,7 +3224,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_groups(r.span.pieces, card_hash_wide()), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5553,8 +5601,54 @@ impl Host {
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        // On the card while three tenths of its budget are free: upload
+        // memory gives way before copies (`shadow::card_for`) and textures.
+        if self.gpu_upload()
+            && self.video_memory().is_some_and(|[budget, used, ..]| used + size <= budget / 10 * 7)
+            && let Some(made) = self.mapped_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, size)
+        {
+            return Some(made);
+        }
+        self.mapped_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, size)
+    }
+
+    /// Whether the CPU can map the card's own memory (GPU upload heaps:
+    /// Resizable BAR and a driver that offers it); asked once.
+    /// `VICTORY_GPU_UPLOAD=0` keeps upload memory and host copies in the
+    /// PC's memory, as before.
+    pub(crate) fn gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes our structure of the given size.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut options).cast(), size_of_val(&options) as u32)
+            };
+            let supported = asked.is_ok() && options.GPUUploadHeapSupported.as_bool();
+            let on = supported && std::env::var_os("VICTORY_GPU_UPLOAD").is_none_or(|v| v != "0");
+            tracing::info!(supported, on, "host GPU upload heaps");
+            on
+        })
+    }
+
+    /// A buffer in the card's memory that the CPU maps for writing only
+    /// (write-combined: never read through the mapping) and shaders read:
+    /// a host copy with no CPU side. Call only with [`Host::gpu_upload`].
+    pub(crate) fn card_mapped_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
+        self.mapped_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, size)
+    }
+
+    fn mapped_buffer(
+        &self,
+        kind: D3D12_HEAP_TYPE,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: kind,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -5568,6 +5662,7 @@ impl Host {
                 Quality: 0,
             },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -5579,7 +5674,7 @@ impl Host {
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    state,
                     None,
                     &mut buffer,
                 )
@@ -5591,7 +5686,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, on_card = kind == D3D12_HEAP_TYPE_GPU_UPLOAD, "no upload buffer");
                 None
             }
         }

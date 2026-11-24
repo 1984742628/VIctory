@@ -71,6 +71,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Bytes of `buffer` if it is in the card's memory with no CPU side
+    /// ([`direct_for`]): `data` maps the card and is never read.
+    direct: u64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -225,7 +228,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; 1024 by default, 0 none).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -241,11 +244,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// (`card_for`): textures keep their room, and once they have filled the
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
-/// alone; what moves is what shaders read.
+/// alone; what moves is what shaders read. (With [`direct_for`] there is
+/// no CPU side, and it does shrink.)
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
@@ -275,6 +279,41 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    }
+    buffer
+}
+
+/// One buffer of `size` bytes in the card's memory that the CPU writes
+/// title memory straight into (`Host::card_mapped_buffer`), for a copy
+/// shaders only read: no CPU side and nothing to send up. Under the limits
+/// of [`card_for`] (a window: [`window_card_for`]), and only where the
+/// host maps the card's memory (`Host::gpu_upload`).
+fn direct_for(size: u64, window: bool) -> Option<(ID3D12Resource, *mut u8)> {
+    let host = host()?;
+    if !cards() || !host.gpu_upload() {
+        return None;
+    }
+    let (bytes, least, most) = if window {
+        (&WINDOW_CARD_BYTES, 0, window_card_most())
+    } else {
+        let (least, most) = card_limits();
+        (&CARD_BYTES[0], least, most)
+    };
+    if size < least || size >= 1 << 30 {
+        return None;
+    }
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
+    }
+    if bytes.fetch_add(size, Ordering::Relaxed) + size > most {
+        bytes.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let buffer = host.card_mapped_buffer(size);
+    if buffer.is_none() {
+        bytes.fetch_sub(size, Ordering::Relaxed);
     }
     buffer
 }
@@ -1399,6 +1438,11 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if window {
+            WINDOW_CARD_BYTES.fetch_sub(self.direct, Ordering::Relaxed);
+        } else {
+            CARD_BYTES[0].fetch_sub(self.direct, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -1719,6 +1763,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            direct: 0,
             place: None,
         }
     }
@@ -1747,6 +1792,19 @@ impl Shadow {
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
             return;
+        }
+        if self.direct != 0 {
+            // Still right, but slow: finding the writes reads the card's
+            // memory through a write-combined mapping.
+            static TOLD: std::sync::Once = std::sync::Once::new();
+            TOLD.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    window = self.window,
+                    "shaders write a host copy made for reading only (VICTORY_GPU_UPLOAD=0 avoids it)"
+                );
+            });
         }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -2649,6 +2707,8 @@ impl Shadow {
 
 struct Entry {
     end: u64,
+    /// Whether the title made the buffer for unordered access.
+    written: bool,
     shadow: Option<Arc<Shadow>>,
 }
 
@@ -2659,12 +2719,14 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A title buffer exists at `start` (`len` bytes).
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
+/// A title buffer exists at `start` (`len` bytes); `written`: shaders may
+/// write it (made for unordered access).
+pub(crate) fn register(resource: usize, start: u64, len: u64, written: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
+            written,
             shadow: None,
         },
     );
@@ -2789,14 +2851,22 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        let written = entry.written;
         // Made without the lock, which every recording thread takes; in
         // place stays under it (`in_place_let_go` must not miss one).
         let held = (!buffer_unlocked()).then_some(map);
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        // One shaders cannot write: straight in the card's memory if it
+        // may be ([`direct_for`]).
+        let direct = if written { None } else { direct_for(size, false) };
+        let on_card = direct.is_some();
+        let (buffer, data) = match direct {
+            Some(direct) => direct,
+            None => host()?.shared_buffer(size)?,
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match (!on_card).then(|| card_for(size)).flatten() {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -2832,6 +2902,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.direct = if on_card { size } else { 0 };
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3032,11 +3103,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // Made without the lock, as a buffer's copy is (`lookup`).
     let held = (!window_unlocked()).then_some(map);
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    // Straight in the card's memory if it may be ([`direct_for`]).
+    let direct = direct_for(len, true);
+    let on_card = direct.is_some();
+    let (buffer, data) = match direct {
+        Some(direct) => direct,
+        None => host()?.shared_buffer(len)?,
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    let (buffer, card) = match (!on_card).then(|| window_card_for(len)).flatten() {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
@@ -3060,6 +3137,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.direct = if on_card { len } else { 0 };
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));

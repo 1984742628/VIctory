@@ -70,7 +70,7 @@ pub(crate) fn probe_level() -> u8 {
 /// except the big ones in the card's memory.
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
+/// memory (the page pool) is turned down here without [`views_in_place`]: its section is made
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
 ///
@@ -88,6 +88,20 @@ pub(crate) fn probe_level() -> u8 {
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `VICTORY_INPLACE_VIEWS=1` (off by default): the runtime makes the
+/// title's page pool of committed sections (1 GiB each, so that a busy PC
+/// can commit them), and with [`level`] view memory that is one run of
+/// such a section is in place too ([`place_run`]): a buffer in the
+/// section's heap, which pins nothing and lets the title remap at will.
+///
+/// Off by default: the pool is committed when made, not when touched;
+/// only the software adapter was asked what it makes of such a heap; and
+/// for title buffers (level 2) the caveat about late wait above stands.
+pub fn views_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
 }
 
 /// The most title memory in place at once, in bytes
@@ -131,6 +145,33 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// As [`place_part`], for view memory: the 64 KiB pages that hold
+/// `[start, start + len)` must be one run of one section made committed,
+/// whose heap (opened once, the whole section) takes the buffer.
+fn place_run(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let mut v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at as usize, bytes as usize) else {
+        return Err(None);
+    };
+    if !v.sections.iter().any(|s| s.0 == section && s.2 && offset + bytes <= s.1) {
+        return Err(None);
+    }
+    let heap = match v.heaps.iter().find(|h| h.0 == section) {
+        Some(heap) => heap.1.clone(),
+        None => {
+            let heap = open(device, From::Section(section)).map_err(Some)?;
+            v.heaps.push((section, heap.clone()));
+            heap
+        }
+    };
+    let buffer = place(device, &heap, offset, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Placed { buffer, heap, gpu, bias: start - at })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -139,7 +180,8 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    let view = cover(start as usize, len as usize) != Cover::None;
+    if view && !views_in_place() {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -148,13 +190,18 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
-        Ok(placed) => {
-            let at = if window { 0 } else { 2 };
-            STATS[at].fetch_add(1, Ordering::Relaxed);
-            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
-            Some(placed)
-        }
+    // Counted before the views are looked at: a remapping that comes after
+    // the look then sees something in place and lets it go
+    // ([`title_memory_freeing`]).
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+    let placed = if view { place_run(&host.device, start, len) } else { place_part(&host.device, start, len) };
+    if placed.is_err() {
+        gone(window, len);
+    }
+    match placed {
+        Ok(placed) => Some(placed),
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
             None
@@ -269,9 +316,11 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// The heaps opened on sections, by handle ([`place_run`]).
+    heaps: Vec<(usize, ID3D12Heap)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new(), heaps: Vec::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -282,6 +331,8 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
+    // A handle used again names another section.
+    v.heaps.retain(|h| h.0 != section);
     v.sections.push((section, bytes, committed));
 }
 
