@@ -67,7 +67,10 @@ off with `=0`: `VICTORY_RELAY` (2; it sends submissions ahead as
 `VICTORY_TEXTURE_NO_WAIT`, `VICTORY_CARD_BUFFERS_MIN_MB` (1) and
 `VICTORY_CARD_BUFFERS_MB` (1024; `=0` gives the earlier 16 and 512). Off by
 default: `VICTORY_INPLACE` (do not set it to 2 with the relay on),
-`VICTORY_BVH_BUILDER`, .... Each is described in a comment where it is read.
+`VICTORY_BVH_BUILDER`, `VICTORY_LARGE_PAGES=1` (large pages for the
+emulator's own snapshot memory; grant your account "Lock pages in memory" in
+`secpol.msc` and sign in again, else it falls back to ordinary pages), ....
+Each is described in a comment where it is read.
 
 ### Known problems
 

@@ -48,7 +48,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: Mutex<Option<Snap>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -823,14 +823,112 @@ mod relay_tests {
     }
 }
 
+/// The size of a large page, if snapshot memory is to be made of them
+/// (`VICTORY_LARGE_PAGES=1`; off by default): fewer page-table walks under
+/// the copies and compares of snapshots. It needs the "Lock pages in
+/// memory" right, which is switched on here once; without it, or where a
+/// buffer cannot be had so, snapshots are ordinary memory as before.
+/// Title memory is never made of large pages (write watch and the guards
+/// work by 4 KiB page).
+fn large_page() -> Option<usize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_LOCK_MEMORY_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Memory::GetLargePageMinimum;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    static PAGE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        if std::env::var_os("VICTORY_LARGE_PAGES").is_none_or(|v| v != "1") {
+            return None;
+        }
+        // SAFETY: plain calls on our own process's token, closed again.
+        let (allowed, page) = unsafe {
+            let mut token = std::ptr::null_mut();
+            let mut luid = LUID { LowPart: 0, HighPart: 0 };
+            let allowed = OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) != 0 && {
+                let found = LookupPrivilegeValueW(std::ptr::null(), SE_LOCK_MEMORY_NAME, &mut luid) != 0;
+                let rights = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+                };
+                // The call succeeds also when the account lacks the right: the last error says.
+                let set = found
+                    && AdjustTokenPrivileges(token, 0, &rights, 0, std::ptr::null_mut(), std::ptr::null_mut()) != 0
+                    && GetLastError() == ERROR_SUCCESS;
+                CloseHandle(token);
+                set
+            };
+            (allowed, GetLargePageMinimum())
+        };
+        let page = (allowed && page != 0).then_some(page);
+        tracing::info!(
+            on = page.is_some(),
+            "large pages for snapshot memory (VICTORY_LARGE_PAGES=1; they need the \"Lock pages in memory\" right)"
+        );
+        page
+    })
+}
+
+/// A snapshot's memory: a vector's, or large pages of ours ([`large_page`]).
+struct Snap {
+    at: *mut u8,
+    bytes: usize,
+    /// The vector, if the memory is one's.
+    heap: Option<Vec<u8>>,
+}
+
+// SAFETY: plain memory owned by the value.
+unsafe impl Send for Snap {}
+
+impl Snap {
+    fn new(n: usize) -> Snap {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if let Some(page) = large_page()
+            && n >= page
+        {
+            let bytes = n.next_multiple_of(page);
+            // SAFETY: a fresh allocation of our own.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) };
+            if !at.is_null() {
+                return Snap { at: at.cast(), bytes, heap: None };
+            }
+        }
+        let mut heap = Vec::with_capacity(n);
+        Snap { at: heap.as_mut_ptr(), bytes: heap.capacity(), heap: Some(heap) }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.at
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.at
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Snap {
+    fn drop(&mut self) {
+        if self.heap.is_none() {
+            // SAFETY: our allocation (`Snap::new`), freed once.
+            unsafe { windows_sys::Win32::System::Memory::VirtualFree(self.at.cast(), 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+        }
+    }
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<Vec<Snap>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
+fn pooled(n: usize) -> Snap {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -839,17 +937,15 @@ fn pooled(n: usize) -> Vec<u8> {
         .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
-    let mut v = match fit {
+    match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+        None => Snap::new(n),
+    }
 }
 
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
-fn give_back(v: Vec<u8>) {
+fn give_back(v: Snap) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
