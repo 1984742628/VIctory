@@ -48,7 +48,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: Mutex<Option<Snap>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -145,16 +145,21 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024);
+/// `=0` is what each was before, 16 and 512.
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+        let mb = |name: &str, default: u64, before: u64| {
+            match std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(0) => before << 20,
+                Some(mb) => mb << 20,
+                None => default << 20,
+            }
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1, 16), mb("VICTORY_CARD_BUFFERS_MB", 1024, 512))
     })
 }
 
@@ -493,9 +498,9 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
-/// what a copy keeps:
+/// (`VICTORY_RELAY=1` or `2`; unset it is on, at `2`, and `0` is off; not
+/// with kept snapshots, [`keeps`]). `crate::host::relay` says what it
+/// does; here it changes what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
 ///   ([`Flights`]): a range two flights declared stays closed to refreshes
@@ -509,7 +514,19 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_RELAY") {
+            Ok(v) => v == "1" || v == "2",
+            // Unset: on, except where nothing may be sent ahead (the timing
+            // run, `VICTORY_LATE_WAIT=0`, title buffers in place).
+            Err(_) => {
+                std::env::var_os("VICTORY_GPU_TIMING").is_none()
+                    && std::env::var("VICTORY_LATE_WAIT").map_or(true, |v| matches!(v.as_str(), "1" | "2" | "3"))
+                    && crate::inplace::level() < 2
+            }
+        };
+        on && !keeps()
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -845,14 +862,112 @@ mod relay_tests {
     }
 }
 
+/// The size of a large page, if snapshot memory is to be made of them
+/// (`VICTORY_LARGE_PAGES=1`; off by default): fewer page-table walks under
+/// the copies and compares of snapshots. It needs the "Lock pages in
+/// memory" right, which is switched on here once; without it, or where a
+/// buffer cannot be had so, snapshots are ordinary memory as before.
+/// Title memory is never made of large pages (write watch and the guards
+/// work by 4 KiB page).
+fn large_page() -> Option<usize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_LOCK_MEMORY_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Memory::GetLargePageMinimum;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    static PAGE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        if std::env::var_os("VICTORY_LARGE_PAGES").is_none_or(|v| v != "1") {
+            return None;
+        }
+        // SAFETY: plain calls on our own process's token, closed again.
+        let (allowed, page) = unsafe {
+            let mut token = std::ptr::null_mut();
+            let mut luid = LUID { LowPart: 0, HighPart: 0 };
+            let allowed = OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) != 0 && {
+                let found = LookupPrivilegeValueW(std::ptr::null(), SE_LOCK_MEMORY_NAME, &mut luid) != 0;
+                let rights = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+                };
+                // The call succeeds also when the account lacks the right: the last error says.
+                let set = found
+                    && AdjustTokenPrivileges(token, 0, &rights, 0, std::ptr::null_mut(), std::ptr::null_mut()) != 0
+                    && GetLastError() == ERROR_SUCCESS;
+                CloseHandle(token);
+                set
+            };
+            (allowed, GetLargePageMinimum())
+        };
+        let page = (allowed && page != 0).then_some(page);
+        tracing::info!(
+            on = page.is_some(),
+            "large pages for snapshot memory (VICTORY_LARGE_PAGES=1; they need the \"Lock pages in memory\" right)"
+        );
+        page
+    })
+}
+
+/// A snapshot's memory: a vector's, or large pages of ours ([`large_page`]).
+struct Snap {
+    at: *mut u8,
+    bytes: usize,
+    /// The vector, if the memory is one's.
+    heap: Option<Vec<u8>>,
+}
+
+// SAFETY: plain memory owned by the value.
+unsafe impl Send for Snap {}
+
+impl Snap {
+    fn new(n: usize) -> Snap {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if let Some(page) = large_page()
+            && n >= page
+        {
+            let bytes = n.next_multiple_of(page);
+            // SAFETY: a fresh allocation of our own.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) };
+            if !at.is_null() {
+                return Snap { at: at.cast(), bytes, heap: None };
+            }
+        }
+        let mut heap = Vec::with_capacity(n);
+        Snap { at: heap.as_mut_ptr(), bytes: heap.capacity(), heap: Some(heap) }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.at
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.at
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Snap {
+    fn drop(&mut self) {
+        if self.heap.is_none() {
+            // SAFETY: our allocation (`Snap::new`), freed once.
+            unsafe { windows_sys::Win32::System::Memory::VirtualFree(self.at.cast(), 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+        }
+    }
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<Vec<Snap>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
+fn pooled(n: usize) -> Snap {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -861,17 +976,15 @@ fn pooled(n: usize) -> Vec<u8> {
         .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
-    let mut v = match fit {
+    match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+        None => Snap::new(n),
+    }
 }
 
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
-fn give_back(v: Vec<u8>) {
+fn give_back(v: Snap) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
@@ -976,7 +1089,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default; `VICTORY_WIDE_BACK=0`: range by range).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -997,7 +1110,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -2007,20 +2120,42 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    self.put_back(start + at, title);
                     written += n;
                 }
             }
-            // Our write shows as a title write at the copy's next refresh,
-            // which copies those pages once more (some dozens of MB a
-            // frame). Asking about the whole range here, to note them
-            // current, cost more: 19-31 askings a frame over 110-174 MB of
-            // view memory, each a walk of its guards.
+            // Where `put_back` could not leave the page guarded, our write
+            // shows as a title write at the copy's next refresh, which
+            // copies those pages once more. Asking about the whole range
+            // here, to note them current, cost more: 19-31 askings a frame
+            // over 110-174 MB of view memory, each a walk of its guards.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
+    }
+
+    /// Writes `bytes`, which the copy holds too, to title memory at `at`
+    /// (what shaders wrote, merged). Where the page stays guarded
+    /// (`crate::watch::write_clean`) and the copy was current there, it
+    /// still is: the next refresh does not take the page for our write.
+    fn put_back(&self, at: usize, bytes: &[u8]) {
+        match crate::watch::write_clean(at, bytes, (self.data, self.start as usize, self.len as usize)) {
+            Some(Some((before, now))) => {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(took) = copied.get_mut(at / PAGE - self.start as usize / PAGE)
+                    && *took != 0
+                    && before <= *took
+                {
+                    *took = now;
+                }
+            }
+            Some(None) => {}
+            None => {
+                crate::watch::writing(at, bytes.len());
+                crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+            }
+        }
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -2624,8 +2759,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.put_back(start + at, title);
                 written = n;
             }
         } else {

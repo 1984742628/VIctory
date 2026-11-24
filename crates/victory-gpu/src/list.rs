@@ -269,8 +269,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
+        crate::host::reap((_state, _uploads));
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }

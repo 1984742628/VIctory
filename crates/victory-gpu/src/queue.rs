@@ -347,7 +347,26 @@ pub(crate) fn release_held(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(mut lists, mut order) => {
+                        // The parts behind this one that stand at waits met
+                        // already run with it: one host submission, not one
+                        // each. `VICTORY_JOIN_PARTS=0`: each its own, as before.
+                        static JOIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        while *JOIN.get_or_init(|| std::env::var_os("VICTORY_JOIN_PARTS").is_none_or(|v| v != "0")) {
+                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            if waits == 0
+                                || !matches!(held.get(waits), Some(Held::Run(..)))
+                                || !held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                            {
+                                break;
+                            }
+                            let Some(Held::Run(more, then)) = held.drain(..=waits).next_back() else {
+                                break;
+                            };
+                            let base = lists.len();
+                            order.extend(then.into_iter().map(|i| base + i));
+                            lists.extend(more);
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(

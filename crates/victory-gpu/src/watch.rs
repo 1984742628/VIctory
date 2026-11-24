@@ -247,6 +247,15 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // A block we guard is view memory, never write-watched: the kernel
+    // would say no, once per submission and range, and again for each half.
+    // `VICTORY_SKIP_VIEW_ASKS=0` asks it, as before.
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SKIP.get_or_init(|| std::env::var_os("VICTORY_SKIP_VIEW_ASKS").is_none_or(|v| v != "0"))
+        && guards().protected.range(first..last).next().is_some()
+    {
+        return false;
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -557,22 +566,39 @@ fn uncommitted_end(block: usize) -> usize {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
+/// notes them written; true if any was guarded. One call to Windows per
+/// run of blocks that touch (`VICTORY_OPEN_RUNS=0`: one per block, as
+/// before).
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    static RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    if blocks.is_empty() {
+        return false;
     }
-    !blocks.is_empty()
+    let runs = blocks.len() > 1 && *RUNS.get_or_init(|| std::env::var_os("VICTORY_OPEN_RUNS").is_none_or(|v| v != "0"));
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    for run in blocks.chunk_by(|a, b| runs && a + 1 == *b) {
+        for block in run {
+            g.protected.remove(block);
+            g.clean.remove(block);
+        }
+        // A run across views fails whole: block by block then, as `protect`.
+        if !set(run[0], run[run.len() - 1] + 1) && run.len() > 1 {
+            for &block in run {
+                set(block, block + 1);
+            }
+        }
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -584,6 +610,74 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// A host copy puts `bytes` (what shaders wrote) into title memory at `at`,
+/// where they lie in one guarded block nothing wrote since it was taken:
+/// the block stays guarded, so the copy's next refresh does not take it
+/// again for our own write. `copy` is the copy's memory, the title address
+/// it starts at and its bytes; it holds `bytes` there already.
+///
+/// `None`: nothing was written (the caller does, after [`writing`]).
+/// `Some(None)`: written, the block opened as [`writing`] opens it.
+/// `Some(Some((before, now)))`: written, the block still guarded and the
+/// journal told for the memory's other copies under asking `now`; `before`
+/// is the page's last write until then.
+/// `VICTORY_BACK_GUARDED=0`: always `None`, as before.
+pub(crate) fn write_clean(at: usize, bytes: &[u8], copy: (*const u8, usize, usize)) -> Option<Option<(u64, u64)>> {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let (data, start, len) = copy;
+    let (from, to) = (at / KERNEL_PAGE * KERNEL_PAGE, (at + bytes.len()).div_ceil(KERNEL_PAGE) * KERNEL_PAGE);
+    let block = at / BLOCK;
+    if bytes.is_empty()
+        || from < start
+        || to > start + len
+        || (to - 1) / BLOCK != block
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_BACK_GUARDED").is_none_or(|v| v != "0"))
+    {
+        return None;
+    }
+    let kept = {
+        let mut g = guards();
+        if !g.clean.contains(&block) {
+            return None;
+        }
+        let set = |protection| {
+            let mut old = 0;
+            // SAFETY: pages of a block we guard; only their protection changes.
+            unsafe { VirtualProtect(from as *const _, to - from, protection, &mut old) != 0 }
+        };
+        if !set(PAGE_READWRITE) {
+            return None;
+        }
+        // SAFETY: a guarded block is a mapped view and stays one while the
+        // guards are held (a remapping asks for them first); the pages are
+        // writable now, and the copy holds all of them (checked above).
+        let same = unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+            // Read-only again before the look: a title write that got in
+            // meanwhile shows in the pages, a later one faults as always.
+            set(PAGE_READONLY)
+                && std::slice::from_raw_parts(from as *const u8, to - from)
+                    == std::slice::from_raw_parts(data.add(from - start), to - from)
+        };
+        if !same {
+            open(&mut g, at, at + 1);
+        }
+        same
+    };
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, bytes.len());
+    if !kept {
+        return Some(None);
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = j.written.get(&(at / PAGE)).copied().unwrap_or(0);
+    j.asked += 1;
+    let now = j.asked;
+    j.written.insert(at / PAGE, now);
+    Some(Some((before, now)))
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -809,6 +903,49 @@ mod tests {
                 },
             )
         };
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// Our own write into a clean guarded block leaves it guarded and tells
+    /// the journal; a block whose pages are not what the copy holds opens.
+    #[test]
+    fn our_write_into_a_clean_guarded_block_leaves_it_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let mut copy = vec![0u8; 2 * BLOCK];
+        let whole = |copy: &Vec<u8>| (copy.as_ptr(), view, 2 * BLOCK);
+        // Not guarded yet: nothing is done.
+        assert_eq!(write_clean(view + 100, b"ours", whole(&copy)), None);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        copy[100..104].copy_from_slice(b"ours");
+        let Some(Some((before, now))) = write_clean(view + 100, b"ours", whole(&copy)) else {
+            panic!("a clean guarded block takes our write and stays guarded");
+        };
+        assert!(now > before);
+        // SAFETY: the bytes just written, in our view.
+        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 4) }, b"ours");
+        // Still clean for the guards; the journal has it for other copies.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        let (_, written) = writes(view, view + 2 * BLOCK, true).expect("a view");
+        assert_eq!(written.last(), Some(&(view / PAGE, now)));
+        // A title write afterwards is still seen.
+        // SAFETY: our view; the handler opens the block.
+        unsafe { ((view + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![view / PAGE]));
+        // The copy does not hold what the page shows: the block opens.
+        assert_eq!(write_clean(view + BLOCK + 100, b"ours", whole(&copy)), Some(None));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![view / PAGE + 1]));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
     }
 
