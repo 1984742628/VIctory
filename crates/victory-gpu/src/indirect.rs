@@ -664,7 +664,9 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        // Both ways of hashing a piece: 64 threads, and one.
+        for wide in [true, false] {
+        let compare = compile_cs(&warp.device, &crate::host::card_compare_source(wide)).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -690,7 +692,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(crate::host::card_groups(PIECES, wide), 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -718,6 +720,7 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
