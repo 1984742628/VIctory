@@ -77,6 +77,20 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
+/// Debugging aid: `VICTORY_SHADER_DUMP=<dir>` saves each container the
+/// title hands over as `<dir>/<hash>.bin`, for `victory shader-info`.
+#[cfg(feature = "diagnostics")]
+fn dump(hash: &str, bytes: &[u8]) {
+    static DIR: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_SHADER_DUMP").map(Into::into));
+    if let Some(dir) = &*DIR {
+        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::write(dir.join(format!("{hash}.bin")), bytes) {
+            tracing::warn!(error = %e, hash, "shader not dumped");
+        }
+    }
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -85,6 +99,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            #[cfg(feature = "diagnostics")]
+            dump(&full.to_hex()[..16], bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
@@ -231,7 +247,8 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
+/// Shader hashes as printed in the pipeline diagnostics, or stage names
+/// (`mesh`, `vertex`, `pixel`, `compute`): every pipeline with that stage.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
@@ -239,12 +256,14 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
-            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if matches!(hash, "mesh" | "vertex" | "pixel" | "compute") {
+                Some(hash.to_owned())
+            } else if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
             } else {
                 tracing::warn!(
                     hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes or stage names"
                 );
                 None
             }
@@ -264,7 +283,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| hashes.contains(&shader.hash) || hashes.iter().any(|h| h == shader.stage))
         .map(|shader| shader.hash.as_str())
 }
 

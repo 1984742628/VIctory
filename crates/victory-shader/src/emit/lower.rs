@@ -37,6 +37,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Whether it reads bounds (`HostShader::bounds`).
+    pub bounds: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -256,6 +258,19 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+
+/// What a scalar memory read the lowering cannot give a value stops with.
+const SCALAR_DATA: Why = "a scalar memory read as data";
+
+/// What a descriptor dword the host has no value for stops with.
+const DESCRIPTOR_DATA: Why = "a descriptor's address or format read as data";
+
+/// What a descriptor no access uses, read only as numbers, stops with.
+const DESCRIPTOR_ONLY_DATA: Why = "a descriptor read only as data";
+
+/// What a descriptor whose access is neither an image nor a buffer one,
+/// read as numbers, stops with.
+const DESCRIPTOR_USE: Why = "a descriptor used by another access read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -823,6 +838,17 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        // Diagnostics: a mesh program reduced to its prologue (counts set,
+        // every primitive culled), the body left out
+        // (`VICTORY_MESH_STUB`), to tell its code from how it is drawn.
+        if let Some(mesh) = self.s.mesh
+            && super::mesh_stub()
+        {
+            self.cur = self.s.entry;
+            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            self.s.m.terminate(self.cur, Term::Ret);
+            return Ok(self.finished());
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -897,13 +923,20 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        Ok(self.finished())
+    }
+
+    /// The lowered program, its code all emitted.
+    fn finished(mut self) -> Lowered {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
-        Ok(Lowered {
+        let bounds = self.s.uses_bounds();
+        Lowered {
             cmp_samplers,
+            bounds,
             root_cbvs,
             root_srvs,
             #[cfg(test)]
@@ -913,7 +946,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
-        })
+        }
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -1959,6 +1992,42 @@ impl<'a> Lower<'a> {
             &[flat, z, z, z],
         );
         self.end_guarded(at, &[]);
+        // Each lane's vertex starts at position 0 (w 0: clipped), all four
+        // channels: the console writes none on some paths (its empty-count
+        // path exports `pos0` with every channel off), the host needs
+        // SV_Position written whole on every path or the program is invalid
+        // (the validator refuses it, and NVIDIA's driver hung on such
+        // programs in Grand Theft Auto VI's world). Exports overwrite it.
+        let guard = (threads > mesh.max_vertices).then(|| {
+            let v = self.s.m.i32(mesh.max_vertices);
+            self.s.m.cmp(e, pred::IULT, flat, v)
+        });
+        let at = self.begin_guarded(guard);
+        let zero = self.s.m.f32(0.0f32.to_bits());
+        let positions: Vec<usize> = (0..self.s.outputs.len())
+            .filter(|&i| self.s.outputs[i].kind == 3)
+            .collect();
+        for id in positions {
+            let el = &mut self.s.outputs[id];
+            el.usage |= (1u8 << el.cols) - 1;
+            let (cols, comp) = (el.cols, el.comp);
+            for col in 0..cols {
+                let (suffix, x) = match comp {
+                    9 => (".f32", zero),
+                    _ => (".i32", z),
+                };
+                let args = [self.s.m.i32(id as u32), z, self.s.m.i8(col), x, flat];
+                self.s.op(
+                    self.cur,
+                    &format!("storeVertexOutput{suffix}"),
+                    Attr::NoUnwind,
+                    void,
+                    171,
+                    &args,
+                );
+            }
+        }
+        self.end_guarded(at, &[]);
         Ok(())
     }
 
@@ -2927,13 +2996,13 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
+        const OTHER: Why = DESCRIPTOR_DATA;
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(SCALAR_DATA);
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -2941,7 +3010,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(SCALAR_DATA),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -2957,7 +3026,7 @@ impl<'a> Lower<'a> {
                 })
             });
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            return Err(DESCRIPTOR_ONLY_DATA);
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -2995,7 +3064,7 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(DESCRIPTOR_USE),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -6692,19 +6761,31 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// indices 0: no area). So does an index at or past the vertex count:
+    /// the console draws such a primitive from whatever is there, but on
+    /// the host an index past `SetMeshOutputCounts` is undefined (it hung
+    /// NVIDIA GPUs in Grand Theft Auto VI's world, where the 10-bit indices
+    /// come from data the host may not have mirrored).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let vertices = self.s.mesh.expect("mesh").max_vertices;
+        let vertices = self.s.m.i32(vertices);
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::new();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let past = self.s.m.cmp(c, pred::IUGE, i, vertices);
+            culled = self.s.m.bin(c, Bin::Or, culled, past);
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
@@ -6908,6 +6989,27 @@ impl<'a> Lower<'a> {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    // A register that holds a descriptor's dwords (any
+                    // stage) or a lane mask (mesh) on this path and data on
+                    // another: the console compiler reuses registers. Neither
+                    // is read as data past such a join in the title's
+                    // programs: mesh code reads no other lanes, and a
+                    // descriptor loaded into a loop and tested at its head
+                    // (`s_cmp_eq_u32` of dword 4) reads zero, as a 2D
+                    // texture's dword 4 does. This kept Grand Theft Auto VI's
+                    // main G-buffer mesh and pixel programs from translating.
+                    // Other values the lowering cannot make (a timestamp, a
+                    // mask in compute or pixel code) stay refused.
+                    // shortcut: zero; wrong if a program did read one as data
+                    // after a join.
+                    (Some(Val::Missing(DESCRIPTOR_DATA | DESCRIPTOR_ONLY_DATA | DESCRIPTOR_USE)), false) => {
+                        self.s.m.i32(0)
+                    }
+                    (Some(Val::Missing(LANE_MASK | SCALAR_DATA)), false)
+                        if self.mask_data == MaskData::None =>
+                    {
+                        self.s.m.i32(0)
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));

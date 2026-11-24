@@ -226,11 +226,76 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// With `VICTORY_DUMP_PASSES` too: copies of render targets as each pass
+/// left them (taken when the title binds other targets), in order, saved
+/// at the present as `frame-<n>-<500 + k>-...`. The end-of-frame dumps miss
+/// what a target held mid-frame (a G-buffer cleared or reused after its
+/// lighting pass read it).
+static SNAPSHOTS: std::sync::Mutex<Vec<(usize, ID3D12Resource)>> = std::sync::Mutex::new(Vec::new());
+
+/// Snapshots per frame at most.
+const MAX_SNAPSHOTS: usize = 160;
+
+fn passes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dump_on() && std::env::var_os("VICTORY_DUMP_PASSES").is_some())
+}
+
+/// Before the title binds other targets in a listed frame: copies render
+/// target `resource` as the pass left it (2D targets at least 640 wide).
+pub(crate) fn snapshot(list: &crate::host::HostList, resource: crate::object::This) {
+    if resource.is_null() || !passes_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let Some(src) = crate::resource::host_resource(resource) else { return };
+    let Some(host) = crate::host::host() else { return };
+    // SAFETY: a live resource.
+    let mut d = unsafe { src.GetDesc() };
+    if d.Width < 640 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 {
+        return;
+    }
+    let mut snaps = SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if snaps.len() >= MAX_SNAPSHOTS {
+        return;
+    }
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut dst: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation with a description of a live texture.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &d,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut dst,
+        )
+    };
+    let (Ok(()), Some(dst)) = (made, dst) else { return };
+    const COPY_SOURCE: u32 = 0x800;
+    crate::list::ensure_state(list, resource, COPY_SOURCE);
+    // SAFETY: an open list; both textures live, same description.
+    unsafe { list.list.CopyResource(&dst, src) };
+    list.keep(&dst);
+    snaps.push((resource as usize, dst));
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    let snaps = std::mem::take(&mut *SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()));
+    for (k, (resource, texture)) in snaps.iter().enumerate() {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        const COPY_DEST: u32 = 0x400;
+        dump_one(host, texture, COPY_DEST, frame, 500 + k, *resource as crate::object::This, &d);
+    }
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.

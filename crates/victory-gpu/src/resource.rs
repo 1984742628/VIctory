@@ -1012,9 +1012,53 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. Made with the resource for render targets, depth and UAV
+    /// textures; on first use for textures only sampled (see [`host_of`]).
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    /// The state the title made the resource in, for a host texture made
+    /// later.
+    #[cfg(windows)]
+    initial_state: u32,
+}
+
+/// A host texture for `desc`, in the console `state`, its tracked state
+/// set (`None` if the host refuses it).
+#[cfg(windows)]
+fn make_host(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<std::sync::Arc<HostTexture>> {
+    host_texture(desc, state, clear).map(|texture| {
+        let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+        std::sync::Arc::new(HostTexture {
+            texture,
+            state: state.into(),
+        })
+    })
+}
+
+/// `r`'s host texture, made now if it is still to be made. Textures only
+/// sampled get theirs on first use: the title makes most of its streamed
+/// textures well before (or without ever) drawing with them, and a host
+/// copy of each from the start took about 4.7 GB of the 5.3 GB of sampled
+/// host textures in Grand Theft Auto VI's world on an 8 GB GPU.
+#[cfg(windows)]
+fn host_of(r: &Resource) -> Option<&std::sync::Arc<HostTexture>> {
+    r.host
+        .get_or_init(|| {
+            let host = make_host(&r.desc, r.initial_state, std::ptr::null());
+            #[cfg(feature = "diagnostics")]
+            if let Some(h) = &host {
+                let id = std::ptr::from_ref(r) as usize;
+                crate::vram::texture_made(id, r.data() as u64, &h.texture, false);
+                // Made because something asked for it.
+                crate::vram::texture_used(id);
+            }
+            host
+        })
+        .as_ref()
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1034,7 +1078,9 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    #[cfg(feature = "diagnostics")]
+    crate::vram::texture_used(this as usize);
+    let host = host_of(resource(this))?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1049,7 +1095,9 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    #[cfg(feature = "diagnostics")]
+    crate::vram::texture_used(this as usize);
+    host_of(resource(this)).map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1058,7 +1106,9 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    #[cfg(feature = "diagnostics")]
+    crate::vram::texture_used(this as usize);
+    host_of(resource(this)).cloned()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -1205,8 +1255,10 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // Render targets, depth and UAV textures (the host GPU writes them).
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let now = desc.dimension == BUFFER || desc.flags & TARGET_DEPTH_UNORDERED != 0;
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1214,14 +1266,24 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        initial_state: state,
     });
+    #[cfg(windows)]
+    if now {
+        let host = make_host(&desc, state, clear);
+        #[cfg(feature = "diagnostics")]
+        if let Some(h) = &host {
+            crate::vram::texture_made(
+                std::ptr::from_ref::<Resource>(&resource) as usize,
+                resource.data() as u64,
+                &h.texture,
+                true,
+            );
+        }
+        let _ = resource.host.set(host);
+    }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
@@ -1233,10 +1295,13 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::vram::texture_gone(std::ptr::from_ref::<Resource>(self) as usize);
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1452,7 +1517,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    host_of(resource(out)).is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(

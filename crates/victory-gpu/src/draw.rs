@@ -167,6 +167,14 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// The host list's pipeline, root signatures and heaps are unknown (host
+    /// work bound its own): bind the title's again before the next command.
+    pub(crate) fn forget_host(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -259,6 +267,11 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
+        // Diagnostics: the targets as the pass that drew to them left them.
+        #[cfg(feature = "diagnostics")]
+        for &t in &self.targets {
+            crate::capture::snapshot(list, t as This);
+        }
         self.targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
@@ -481,6 +494,32 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                // SAFETY: an open list; `values` covers the parameter.
+                unsafe {
+                    if compute {
+                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                    } else {
+                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                    }
+                }
+            }
+            if let Some((param, dwords)) = stage.bounds {
+                // The bound view heap's slots, then per root SRV the bytes its
+                // host copy holds from the title's address (0, unbounded,
+                // where there is none).
+                let mut values = vec![0u32; dwords as usize];
+                values[0] = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .map_or(0, |h| h.slots());
+                for (k, &(slot, _)) in stage.root_srvs.iter().enumerate() {
+                    if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                        && let Some(shadow) = crate::shadow::find(*address, 1)
+                    {
+                        let left = shadow.left(*address).min(u64::from(u32::MAX));
+                        values[1 + k] = left as u32;
+                    }
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -844,7 +883,7 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
+        let rects = self.topology == RECTANGLES && !self.rectangles_on_gpu();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -867,6 +906,12 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// Whether the bound pipeline makes rectangles' fourth corners on the
+    /// GPU (a geometry shader), so its rectangle draws go as triangles.
+    fn rectangles_on_gpu(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rectangles)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -935,10 +980,11 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        let rects = self.topology == RECTANGLES && !self.rectangles_on_gpu();
+        if rects {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1019,7 +1065,10 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => {
+                (self.topology != RECTANGLES || self.rectangles_on_gpu())
+                    && self.prepare(list, kind == INDEXED)
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),

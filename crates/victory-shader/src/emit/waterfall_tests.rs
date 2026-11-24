@@ -74,6 +74,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     // One access with each lane's own heap index, no wave operation.
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
+    // Its heap index comes from data: it is kept inside the bound heap.
+    assert!(lowered.bounds);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -82,6 +84,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        bounds: lowered.bounds,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

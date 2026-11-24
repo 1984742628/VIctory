@@ -20,11 +20,15 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod vram;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod ffx;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]

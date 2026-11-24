@@ -126,7 +126,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -136,6 +136,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: triangles in, strips of up to four vertices out, stream 0.
+    pub gs: bool,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -188,6 +190,17 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if p.gs {
+        // GSInfo: input primitive (3 triangle), output topology (5
+        // triangle strip), stream mask, position written; then the
+        // maximum vertex count.
+        info[0..16].fill(0);
+        info[0..4].copy_from_slice(&3u32.to_le_bytes());
+        info[4..8].copy_from_slice(&5u32.to_le_bytes());
+        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+        info[12] = u8::from(p.outputs.iter().any(|o| o.kind == 3));
+        info[26..28].copy_from_slice(&4u16.to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);

@@ -103,7 +103,10 @@ impl GraphicsState {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
-                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                11 => {
+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    relax_equal_depth(&mut self.depth);
+                }
                 21 => {
                     // shortcut: the depth bounds test is dropped (the host
                     // pipeline uses the plain description); bring it back
@@ -119,6 +122,7 @@ impl GraphicsState {
                         FrontFace: d.FrontFace,
                         BackFace: d.BackFace,
                     };
+                    relax_equal_depth(&mut self.depth);
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
@@ -251,6 +255,9 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// The root parameter of its bounds and their dwords, if it reads them
+    /// (see `HostShader::bounds`).
+    pub(crate) bounds: Option<(u32, u32)>,
 }
 
 impl Stage {
@@ -273,6 +280,10 @@ pub(crate) struct HostPipeline {
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
+    /// A rectangle-list pipeline whose geometry shader makes each
+    /// rectangle's fourth corner (`victory_shader::emit::rectangle_gs`):
+    /// its draws go to the host as plain triangle lists.
+    pub(crate) rectangles: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
 }
@@ -330,6 +341,32 @@ fn wave_lanes_unsupported(
     wave64_stage && host_max < 64
 }
 
+/// Diagnostics: `VICTORY_DEPTH_EQUAL=le|ge|always` turns an EQUAL depth
+/// test into that one, to see whether a pass drawn over a depth pre-pass
+/// fails it for depths the host computes a little differently.
+fn relax_equal_depth(depth: &mut D3D12_DEPTH_STENCIL_DESC) {
+    // Diagnostics: `VICTORY_NO_DEPTH_STENCIL` turns both tests off.
+    if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_NO_DEPTH_STENCIL").is_some() {
+        depth.DepthEnable = false.into();
+        depth.StencilEnable = false.into();
+        return;
+    }
+    if !cfg!(feature = "diagnostics") || depth.DepthFunc != D3D12_COMPARISON_FUNC_EQUAL {
+        return;
+    }
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(n, write = depth.DepthWriteMask.0, "pipelines with an EQUAL depth test");
+    }
+    depth.DepthFunc = match std::env::var("VICTORY_DEPTH_EQUAL").as_deref() {
+        Ok("le") => D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        Ok("ge") => D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+        Ok("always") => D3D12_COMPARISON_FUNC_ALWAYS,
+        _ => return,
+    };
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -377,7 +414,16 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host_lanes = host()?.wave_lanes();
+        // Diagnostics: `VICTORY_WAVE64_MESH` keeps wave64 mesh programs on
+        // narrower hosts (their translation reads no other lanes).
+        let keep_mesh = cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_WAVE64_MESH").is_some();
+        // And `VICTORY_WAVE64_COMPUTE` keeps unsized wave64 compute programs (#578
+        // refuses them on 32-lane hosts: some hang).
+        let keep_compute = cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_WAVE64_COMPUTE").is_some();
         if let Some(ms) = mesh
+            && !keep_mesh
             && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
         {
             return refuse(
@@ -392,7 +438,9 @@ impl HostPipeline {
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
-            if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
+            if !(keep_mesh && s.stage == "mesh" || keep_compute && s.stage == "compute")
+                && wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes)
+            {
                 return refuse(
                     if host_lanes.1 < 32 {
                         "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
@@ -416,7 +464,22 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                bounds: None,
             };
+            if t.bounds {
+                stage.bounds = Some((params.len() as u32, t.bounds_dwords()));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: victory_shader::emit::BOUNDS_REGISTER,
+                            RegisterSpace: USER_DATA_SPACE,
+                            Num32BitValues: t.bounds_dwords(),
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
@@ -485,7 +548,25 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Diagnostics: `VICTORY_WHITE_PS` draws every pixel stage white
+        // (see `victory_shader::emit::white_ps`).
+        static WHITE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+        let white = WHITE
+            .get_or_init(|| {
+                (cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_WHITE_PS").is_some())
+                    .then(victory_shader::emit::white_ps)
+            })
+            .as_ref();
         let code = |i: usize| {
+            if i == 1
+                && let Some(w) = white
+                && stages.get(1).is_some_and(|(s, _)| s.stage == "pixel")
+            {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: w.as_ptr().cast(),
+                    BytecodeLength: w.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -528,6 +609,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rectangles: false,
             });
         }
         let Some(g) = g else {
@@ -560,14 +642,36 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rectangles: false,
             });
         }
 
+        // Rectangle lists whose vertex shader reads no vertex buffers (the
+        // corners come from the vertex index): a geometry shader makes the
+        // fourth corner from the vertex shader's outputs, as the console
+        // does. Those with vertex buffers are expanded on the CPU (`draw`).
+        let gs = (g.topology.0 == RECTANGLES && g.inputs.is_empty())
+            .then(|| stages[0].0.translated())
+            .flatten()
+            .and_then(|t| match victory_shader::emit::rectangle_gs(&t.host) {
+                Ok(gs) => Some(gs),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                    None
+                }
+            });
+        let gs_code = gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |b| {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.as_ptr().cast(),
+                BytecodeLength: b.len(),
+            }
+        });
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
+            GS: gs_code,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -592,7 +696,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&code_bytes(&code(0)), &code_bytes(&code(1)), &code_bytes(&gs_code)],
             &state,
         );
         let made = super::library::pipeline(
@@ -630,6 +734,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            rectangles: gs.is_some(),
         })
     }
 }

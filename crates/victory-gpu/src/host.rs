@@ -290,6 +290,79 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// A copy into title memory whose destination has a page that is only
+    /// reserved neither faults nor writes that page; a mapped destination
+    /// is copied whole.
+    #[test]
+    fn title_copies_skip_unmapped_destinations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE: usize = 64 << 10;
+        let src = vec![0xA5u8; 2 * PAGE];
+        // SAFETY: a fresh reservation, its first page committed.
+        let dst = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!p.is_null());
+            assert!(!VirtualAlloc(p, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            p.cast::<u8>()
+        };
+        // Across the reserved page: no fault, the reserved page untouched.
+        copy_mapped(dst, src.as_ptr(), 2 * PAGE, true);
+        assert!(!crate::texture::committed(dst.wrapping_add(PAGE), PAGE));
+        // Inside the committed page: copied.
+        copy_mapped(dst, src.as_ptr(), PAGE, true);
+        // SAFETY: the committed page.
+        let copied = unsafe { std::slice::from_raw_parts(dst, PAGE) };
+        assert!(copied.iter().all(|&b| b == 0xA5));
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(dst.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// A source with unmapped runs (whole 64 KiB pages, single 4 KiB pages,
+    /// a run across pieces) copies what is mapped and zeros for the rest.
+    #[test]
+    fn copies_read_zeros_where_the_source_is_unmapped() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const K4: usize = 4096;
+        const LEN: usize = 8 * (64 << 10);
+        // Committed 4 KiB pages: all of 64 KiB page 0, page 1's first
+        // half, one page in page 2, nothing in 3-4, pages 5-7 but for one
+        // 4 KiB page in 6.
+        let committed = |page: usize| match page / 16 {
+            0 => true,
+            1 => page % 16 < 8,
+            2 => page % 16 == 5,
+            3 | 4 => false,
+            6 => page % 16 != 9,
+            _ => true,
+        };
+        // SAFETY: a fresh reservation; its committed pages are written.
+        let src = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!p.is_null());
+            for page in (0..LEN / K4).filter(|&k| committed(k)) {
+                let at = p.add(page * K4);
+                assert!(!VirtualAlloc(at.cast(), K4, MEM_COMMIT, PAGE_READWRITE).is_null());
+                at.write_bytes(page as u8 | 1, K4);
+            }
+            p
+        };
+        // From an unaligned start to past the middle of the last page.
+        let (from, len) = (100, LEN - 100 - 3000);
+        let mut dst = vec![0xEEu8; len];
+        copy_mapped(dst.as_mut_ptr(), src.wrapping_add(from), len, false);
+        for (i, &b) in dst.iter().enumerate() {
+            let page = (from + i) / K4;
+            let want = if committed(page) { page as u8 | 1 } else { 0 };
+            assert_eq!(b, want, "byte {i} (4 KiB page {page})");
+        }
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(src.cast(), 0, MEM_RELEASE) };
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -1340,12 +1413,16 @@ impl Batch {
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// destination (`title_dst`) that is not all mapped is left alone (but for
+/// what the kernel's copy wrote before it met the unmapped page, as
+/// [`write_mapped`] does).
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// The copy goes through the kernel (`ReadProcessMemory`), which reports an
+/// unmapped page at either end instead of faulting. `VirtualQuery` is asked
+/// only after a copy failed: it costs 0.2-2 ms per call in the title's big
+/// pools (it walks the page tables to the region's end), which made copies
+/// run at 100-200 MB/s, and checking each title destination first cost
+/// about 240 ms per world frame (a thousand small copies).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1357,7 +1434,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
@@ -1369,27 +1446,59 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
-    if whole {
+    if whole || title_dst && !crate::texture::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(feature = "diagnostics")]
+    let piecewise = std::time::Instant::now();
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read. A 4 KiB page that fails
+    // asks the kernel where its uncommitted run ends, and the run is zeroed
+    // whole: failing each of its pages (about 3 us each) cost the world
+    // ~80 ms per frame, in buffers refreshed several times per frame.
+    let zero = |at: usize, end: usize| {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unmapped, (end - at) as u64);
+        // SAFETY: inside the destination, which is mapped.
+        unsafe { dst.wrapping_add(at - src as usize).write_bytes(0, end - at) };
+    };
+    // The end of the uncommitted run last found.
+    let mut hole = 0;
     for_pieces(src as usize, len, 64 << 10, |at, n| {
+        let end = at + n;
+        if at < hole {
+            zero(at, end.min(hole));
+            if end <= hole {
+                return;
+            }
+        }
+        let at = at.max(hole);
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+        if read(at as *const u8, to, end - at) {
+            return;
+        }
+        let mut p = at;
+        while p < end {
+            let next = ((p / 4096 + 1) * 4096).min(end);
+            if read(p as *const u8, dst.wrapping_add(p - src as usize), next - p) {
+                p = next;
+                continue;
+            }
+            let stop = match uncommitted_end(p) {
+                Some(e) => {
+                    hole = e;
+                    e.clamp(next, end)
                 }
-            });
+                None => next,
+            };
+            zero(p, stop);
+            p = stop;
         }
     });
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::range(src as usize, len, piecewise.elapsed().as_micros() as u64, 1);
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1404,8 +1513,8 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    // SAFETY: the kernel checks both ranges (an unmapped or read-only page
+    // fails the call instead of faulting).
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
@@ -1435,6 +1544,25 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
+/// Where the uncommitted (free or only reserved) run of memory holding `at`
+/// ends; `None` if `at` is committed (unreadable for another reason).
+fn uncommitted_end(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Queries, 1);
+        add(C::QueryUs, started.elapsed().as_micros() as u64);
+    }
+    (n != 0 && info.State != MEM_COMMIT).then(|| info.BaseAddress as usize + info.RegionSize)
+}
+
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
     let end = start + len;
     let mut at = start;
@@ -1785,6 +1913,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::vram::log();
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -2551,5 +2680,55 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 3).is_some(),
             "single-plane presentation after compositor initialization failed"
         );
+    }
+}
+
+/// What copies over memory with unmapped pages cost. Run with
+/// `cargo test --release -p victory-gpu -- --ignored --nocapture unmapped_copy_costs`.
+#[cfg(test)]
+mod unmapped_bench {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// Mean time of `n` runs of `f`.
+    fn time(n: u32, mut f: impl FnMut()) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t.elapsed() / n
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn unmapped_copy_costs() {
+        const P: usize = 64 << 10;
+        // 4 MiB, every other 64 KiB page committed.
+        const N: usize = 64;
+        // SAFETY: a fresh reservation, released at the end.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N * P, MEM_RESERVE, PAGE_READWRITE);
+            for i in (0..N).step_by(2) {
+                let at = base.cast::<u8>().add(i * P);
+                VirtualAlloc(at.cast(), P, MEM_COMMIT, PAGE_READWRITE);
+            }
+            base.cast::<u8>()
+        };
+        let mut dst = vec![0u8; N * P];
+        let to = dst.as_mut_ptr();
+        let hole = base.wrapping_add(P);
+        let whole = time(20, || copy_mapped(to, base, N * P, false));
+        eprintln!("copy_mapped of 4 MiB, half unmapped: {whole:?}");
+        let failed = time(1000, || _ = read(hole, to, P));
+        eprintln!("failed 64 KiB read: {failed:?}");
+        let failed = time(1000, || _ = read(hole, to, 4096));
+        eprintln!("failed 4 KiB read: {failed:?}");
+        eprintln!("64 KiB read: {:?}", time(1000, || _ = read(base, to, P)));
+        let query = time(1000, || _ = uncommitted_end(hole as usize));
+        eprintln!("uncommitted_end: {query:?}");
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }

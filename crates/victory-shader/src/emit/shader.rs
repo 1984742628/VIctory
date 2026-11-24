@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -12,6 +12,15 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the shader reads its bounds (root constants, `b<this>` in
+/// [`USER_DATA_SPACE`]): dword 0 the bound view heap's slot count, dword
+/// 1 + k the bytes the host's buffer holds from the address of root SRV k
+/// (`root_srvs` order). Heap view indices and root SRV byte offsets are
+/// kept inside them; a 0 leaves them as computed.
+pub const BOUNDS_REGISTER: u32 = 1;
+
+/// The bounds buffer's size annotation until `finish` knows it.
+const BOUNDS_SIZE_PLACEHOLDER: u32 = u32::MAX - 1;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -55,8 +64,16 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader taking triangles and giving strips of up to four
+    /// vertices on stream 0 (the rectangle-list expander, `rect`).
+    pub gs: bool,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
+    /// The bounds buffer's handle ([`BOUNDS_REGISTER`]), once the shader
+    /// bounds a heap view index or a root SRV offset.
+    bounds: Option<V>,
+    /// Bounds dwords loaded so far, by index.
+    bound_dwords: Vec<(u32, V)>,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
@@ -115,7 +132,10 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            gs: false,
             user_data: 0,
+            bounds: None,
+            bound_dwords: Vec::new(),
             samplers: 0,
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
@@ -162,6 +182,14 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
+        // A root SRV has no size on the host: a byte offset from title data
+        // past the buffer reads whatever lies beyond it, which faults (and
+        // on NVIDIA hangs) the GPU. Keep it inside the buffer the host bound.
+        if name.starts_with("rawBufferLoad")
+            && let Some(k) = self.root_srvs.iter().position(|r| r.1 == args[0])
+        {
+            all[2] = self.bound_root_offset(block, k as u32, args[1]);
+        }
         self.m.call(block, f, all)
     }
 
@@ -186,6 +214,67 @@ impl Shader {
         );
         // The size is known in `finish`, which fixes this placeholder.
         self.annotate(block, h, 13, u32::MAX)
+    }
+
+    /// Whether the shader reads the bounds buffer ([`BOUNDS_REGISTER`]).
+    pub fn uses_bounds(&self) -> bool {
+        self.bounds.is_some()
+    }
+
+    /// Bounds dword `index`, loaded once in the entry block (0 when the host
+    /// sets none).
+    fn bound_dword(&mut self, index: u32) -> V {
+        if let Some(&(_, v)) = self.bound_dwords.iter().find(|d| d.0 == index) {
+            return v;
+        }
+        let block = self.entry;
+        let h = match self.bounds {
+            Some(h) => h,
+            None => {
+                let r = self.m.i32(BOUNDS_REGISTER);
+                let bind = [r, r, self.m.i32(USER_DATA_SPACE), self.m.i8(2)];
+                let bind = self.m.aggregate(self.t.bind, &bind);
+                let f = self.m.bool(false);
+                let h = self.op(
+                    block,
+                    "createHandleFromBinding",
+                    Attr::ReadNone,
+                    self.t.handle,
+                    217,
+                    &[bind, r, f],
+                );
+                // The size is known in `finish`, which fixes this placeholder.
+                let h = self.annotate(block, h, 13, BOUNDS_SIZE_PLACEHOLDER);
+                self.bounds = Some(h);
+                h
+            }
+        };
+        let row = self.m.i32(index / 4);
+        let ret = self.t.cbuf_ret;
+        let r = self.op(block, "cbufferLoadLegacy.i32", Attr::ReadOnly, ret, 59, &[h, row]);
+        let v = self.m.extract(block, r, index % 4);
+        self.bound_dwords.push((index, v));
+        v
+    }
+
+    /// The bound view heap's slot count (bounds dword 0).
+    pub fn view_limit(&mut self) -> V {
+        self.bound_dword(0)
+    }
+
+    /// `byte` kept where a 16-byte load from root SRV `k` stays inside the
+    /// host's buffer: at most its length less 16 (0 when it is shorter), or
+    /// unchanged when the host sets no length (0).
+    fn bound_root_offset(&mut self, block: usize, k: u32, byte: V) -> V {
+        let len = self.bound_dword(1 + k);
+        let (zero, sixteen, max) = (self.m.i32(0), self.m.i32(16), self.m.i32(u32::MAX));
+        let room = self.m.bin(block, Bin::Sub, len, sixteen);
+        let short = self.m.cmp(block, pred::IULT, len, sixteen);
+        let last = self.m.select(block, short, zero, room);
+        let unset = self.m.cmp(block, pred::EQ, len, zero);
+        let last = self.m.select(block, unset, max, last);
+        let over = self.m.cmp(block, pred::IUGT, byte, last);
+        self.m.select(block, over, last, byte)
     }
 
     /// The handle of the root CBV of root parameter `slot`, made in the
@@ -292,6 +381,20 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // A view index from title data may lie past the host's heap (its
+        // views are capped at 1,000,000 on NVIDIA, below the title's
+        // count), which is undefined and can hang the GPU: one at or past
+        // the heap's last slot reads that slot, which the host keeps null.
+        // With no count set (0), the last slot is u32::MAX: no change.
+        let index = if sampler {
+            index
+        } else {
+            let count = self.view_limit();
+            let one = self.m.i32(1);
+            let last = self.m.bin(block, Bin::Sub, count, one);
+            let over = self.m.cmp(block, pred::IUGT, index, last);
+            self.m.select(block, over, last, index)
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -308,6 +411,14 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        let bounds_dwords = (1 + self.root_srvs.len() as u32).next_multiple_of(4);
+        if self.bounds.is_some() {
+            let old = [self.m.i32(13), self.m.i32(BOUNDS_SIZE_PLACEHOLDER)];
+            let old = self.m.aggregate(self.t.props, &old);
+            let new = [self.m.i32(13), self.m.i32(bounds_dwords * 4)];
+            let new = self.m.aggregate(self.t.props, &new);
+            self.m.replace_const(old, new);
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -315,6 +426,7 @@ impl Shader {
             s.m.md_value(c)
         };
         if self.user_data > 0
+            || self.bounds.is_some()
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
@@ -342,6 +454,29 @@ impl Shader {
                     kind: 2,
                     space: USER_DATA_SPACE,
                     register: 0,
+                    dxil_kind: 13,
+                });
+            }
+            if self.bounds.is_some() {
+                let arr = self.m.array(bounds_dwords, self.t.i32);
+                let ty = self.m.named_struct("Bounds", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, USER_DATA_SPACE)),
+                    Some(i32c(&mut self, BOUNDS_REGISTER)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, bounds_dwords * 4)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: USER_DATA_SPACE,
+                    register: BOUNDS_REGISTER,
                     dxil_kind: 13,
                 });
             }
@@ -522,6 +657,14 @@ impl Shader {
                 }
             }
         }
+        // Geometry state (tag 1): input primitive (3 triangle), maximum
+        // vertices, stream mask, output topology (5 triangle strip),
+        // instances.
+        if self.gs {
+            props.push(i32c(&mut self, 1));
+            let state = [3, 4, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
+        }
         if let Some(n) = self.wave_size {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
@@ -543,9 +686,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.gs => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -599,6 +743,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

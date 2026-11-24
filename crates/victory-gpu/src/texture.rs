@@ -315,6 +315,10 @@ fn detile_subresource(
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(started);
     let mut p = at as usize;
     let end = p + len;
     while p < end {
@@ -328,6 +332,19 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         p = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// Counts a [`committed`] check and its time (diagnostics).
+#[cfg(feature = "diagnostics")]
+struct Timed(std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        use crate::copystat::{C, add};
+        add(C::Queries, 1);
+        add(C::QueryUs, self.0.elapsed().as_micros() as u64);
+    }
 }
 
 /// The staging state of a title texture, made on first use.

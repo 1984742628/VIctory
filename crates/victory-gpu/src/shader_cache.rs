@@ -53,6 +53,7 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(u8::from(victory_shader::emit::mesh_stub()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -210,6 +211,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.bounds));
     out
 }
 
@@ -266,6 +268,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let bounds = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +281,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        bounds,
     })
 }
 
@@ -300,6 +308,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            bounds: true,
         }
     }
 

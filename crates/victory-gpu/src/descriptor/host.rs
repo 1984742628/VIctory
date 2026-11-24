@@ -20,7 +20,9 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`MIN_DYNAMIC`], less the last slot
+    /// of a view heap, which stays null: translated shaders read it for a
+    /// view index past the heap ([`HostHeap::slots`]).
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -112,7 +114,13 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    // The full dynamic pool: with 2^16, Grand Theft Auto VI's
+                    // world tables ran it dry in every submission and most
+                    // indirect draws and mesh dispatches were dropped (an
+                    // almost empty G-buffer, #747). The title's slots past
+                    // the rest (above ~738k, which it was not seen to read)
+                    // read the guard slot instead.
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -141,7 +149,7 @@ impl HostHeap {
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic: extra.saturating_sub(1),
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -261,6 +269,13 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// All its slots, the last of a view heap being the null slot that
+    /// translated shaders read for a view index at or past this (bound as
+    /// the first dword of their bounds, `HostShader::bounds`).
+    pub(crate) fn slots(&self) -> u32 {
+        self.count + self.dynamic + u32::from(!self.sampler)
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -1202,5 +1217,26 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A view heap's last slot, which translated shaders read for a view
+    /// index past the heap, is never handed out, so it stays null.
+    #[test]
+    fn the_last_view_slot_stays_null() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let last = heap.slots() - 1;
+        assert_eq!(last, heap.count() + heap.dynamic);
+        let mut taken = Vec::new();
+        while let Some(first) = heap.dynamic(1) {
+            assert_ne!(first, last);
+            taken.push(first);
+        }
+        assert_eq!(taken.len() as u32, heap.dynamic);
+        // Samplers have no such slot.
+        if let Some(samplers) = HostHeap::new(true, 4) {
+            assert_eq!(samplers.slots(), samplers.count());
+        }
     }
 }

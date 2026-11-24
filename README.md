@@ -85,6 +85,12 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Upscaler: the title uses AMD's FidelityFX upscaler (FSR) on Series S. Point
+`VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` of AMD's public
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+(2.x) to answer its calls with the PC upscaler for D3D12 instead of the
+console's, which only has 1080p tables.
+
 ## Commands
 
 ```
@@ -121,12 +127,14 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash, or a shader of a listed stage (`mesh`, `vertex`, `pixel`, `compute`) |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_UPSCALER=<rva>[,<kind>]` | the title's upscaler picker returns `kind` (default 7, FidelityFX; 1.0.2.1: `7E93F0`); FidelityFX on Series X |
+| `VICTORY_FFX_SCALE=<scale>[,<rva>]` | render scale of the title's FidelityFX path (`0.6667`: 1440p for 4K, `0.5`: 1080p; 1.0.2.1 default rva `28EF680`); Series X otherwise renders native 4K and overflows its memory plan |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.

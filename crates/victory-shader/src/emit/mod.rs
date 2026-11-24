@@ -82,6 +82,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod rect;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -97,7 +98,8 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use rect::{rectangle_gs, white_ps};
+pub use shader::{BOUNDS_REGISTER, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -119,6 +121,17 @@ pub fn loop_limit() -> u32 {
         } else {
             lower::LOOP_LIMIT
         }
+    })
+}
+
+/// Diagnostics: `VICTORY_MESH_STUB` reduces every mesh program to its
+/// prologue (output counts set, every primitive culled), to tell a fault in
+/// mesh code from one in how mesh draws are made. Part of the translation,
+/// so the shader cache keys on it.
+pub fn mesh_stub() -> bool {
+    static STUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STUB.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_MESH_STUB").is_some()
     })
 }
 
@@ -156,6 +169,14 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Whether it reads bounds: [`HostShader::bounds_dwords`] 32-bit root
+    /// constants at `b`[`BOUNDS_REGISTER`] in [`USER_DATA_SPACE`]. Dword 0
+    /// is the bound view heap's slot count: view indices it computes at or
+    /// past it read the heap's last slot, which the host keeps null. Dword
+    /// 1 + k is the bytes the host's buffer holds from the address of root
+    /// SRV `root_srvs[k]`: byte offsets are kept inside. 0 leaves either
+    /// unbounded.
+    pub bounds: bool,
 }
 
 impl HostShader {
@@ -169,6 +190,15 @@ impl HostShader {
             .max()
             .unwrap_or(0);
         n.next_multiple_of(4)
+    }
+
+    /// Root constants its bounds take (0 without [`HostShader::bounds`]).
+    pub fn bounds_dwords(&self) -> u32 {
+        if self.bounds {
+            (1 + self.root_srvs.len() as u32).next_multiple_of(4)
+        } else {
+            0
+        }
     }
 }
 
@@ -308,6 +338,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        bounds: l.bounds,
     })
 }
 
@@ -565,6 +596,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            bounds: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +607,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                bounds: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

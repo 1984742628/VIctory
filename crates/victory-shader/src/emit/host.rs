@@ -158,6 +158,23 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // The bounds of stages that read them, last (set by `dispatch` and
+        // `draw`, see `bounds_params`).
+        let mut limits = Vec::new();
+        for &(s, vis) in stages.iter().filter(|(s, _)| s.bounds) {
+            limits.push((params.len() as u32, s.bounds_dwords()));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: super::BOUNDS_REGISTER,
+                        RegisterSpace: super::USER_DATA_SPACE,
+                        Num32BitValues: s.bounds_dwords(),
+                    },
+                },
+                ShaderVisibility: vis,
+            });
+        }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -204,7 +221,13 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature =
+                self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            bounds_params()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(root.as_raw() as usize, limits);
+            Ok(root)
         }
     }
 
@@ -486,6 +509,12 @@ pub fn stub_ps() -> HostShader {
     stub(true, vec![target])
 }
 
+/// A vertex shader writing zeros to `outputs` (tests).
+#[cfg(test)]
+pub(crate) fn stub_vertex(outputs: Vec<SigElement>) -> HostShader {
+    stub(false, outputs)
+}
+
 fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     use super::bitcode::{Attr, Term};
     let mut s = super::shader::Shader::new(pixel);
@@ -528,7 +557,30 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        bounds: false,
     }
+}
+
+/// Bounds parameters of a root signature: (root parameter, dwords).
+type BoundsParams = Vec<(u32, u32)>;
+
+/// The bounds root parameters of each root signature the harness made (by
+/// its address): [`HostShader::bounds`] stages read them.
+fn bounds_params() -> &'static std::sync::Mutex<std::collections::HashMap<usize, BoundsParams>> {
+    static PARAMS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, BoundsParams>>> =
+        std::sync::OnceLock::new();
+    PARAMS.get_or_init(Default::default)
+}
+
+/// The bounds parameters of `root` (none for a signature made elsewhere).
+#[cfg(test)]
+fn bounds_of(root: &ID3D12RootSignature) -> BoundsParams {
+    bounds_params()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(root.as_raw() as usize))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// A root argument for [`Host::draw`].
@@ -765,6 +817,11 @@ impl Host {
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
+            for (param, dwords) in bounds_of(root) {
+                let mut values = vec![0u32; dwords as usize];
+                values[0] = d.textures.len().max(1) as u32;
+                list.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -1290,6 +1347,12 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            // The heap's size; root SRV lengths unset (0: unbounded).
+            for (param, dwords) in bounds_of(root) {
+                let mut values = vec![0u32; dwords as usize];
+                values[0] = d.views.len().max(1) as u32;
+                list.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
