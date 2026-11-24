@@ -35,7 +35,7 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
+| Frame rate in the world | 2-4 fps: 240-350 ms per frame was measured with the switches that are now the default (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK`, `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`), 420-450 ms with them off; it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
 ### What this fork changed (summary)
@@ -60,10 +60,14 @@ Speed and memory:
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
+The newer speed changes sit behind environment switches. On by default, and
+off with `=0`: `VICTORY_RELAY` (2; it sends submissions ahead as
+`VICTORY_LATE_WAIT=3`), `VICTORY_WIDE_BACK`, `VICTORY_WIDE_MERGE`,
+`VICTORY_WIDE_REFRESH`, `VICTORY_CARD_REHASH_RUNS`, `VICTORY_JOIN_COPIES`,
+`VICTORY_TEXTURE_NO_WAIT`, `VICTORY_CARD_BUFFERS_MIN_MB` (1) and
+`VICTORY_CARD_BUFFERS_MB` (1024; `=0` gives the earlier 16 and 512). Off by
+default: `VICTORY_INPLACE` (do not set it to 2 with the relay on),
+`VICTORY_BVH_BUILDER`, .... Each is described in a comment where it is read.
 
 ### Known problems
 

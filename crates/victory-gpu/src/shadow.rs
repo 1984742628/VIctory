@@ -142,16 +142,21 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024);
+/// `=0` is what each was before, 16 and 512.
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+        let mb = |name: &str, default: u64, before: u64| {
+            match std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(0) => before << 20,
+                Some(mb) => mb << 20,
+                None => default << 20,
+            }
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1, 16), mb("VICTORY_CARD_BUFFERS_MB", 1024, 512))
     })
 }
 
@@ -454,9 +459,9 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
-/// what a copy keeps:
+/// (`VICTORY_RELAY=1` or `2`; unset it is on, at `2`, and `0` is off; not
+/// with kept snapshots, [`keeps`]). `crate::host::relay` says what it
+/// does; here it changes what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
 ///   ([`Flights`]): a range two flights declared stays closed to refreshes
@@ -470,7 +475,19 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_RELAY") {
+            Ok(v) => v == "1" || v == "2",
+            // Unset: on, except where nothing may be sent ahead (the timing
+            // run, `VICTORY_LATE_WAIT=0`, title buffers in place).
+            Err(_) => {
+                std::env::var_os("VICTORY_GPU_TIMING").is_none()
+                    && std::env::var("VICTORY_LATE_WAIT").map_or(true, |v| matches!(v.as_str(), "1" | "2" | "3"))
+                    && crate::inplace::level() < 2
+            }
+        };
+        on && !keeps()
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -937,7 +954,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default; `VICTORY_WIDE_BACK=0`: range by range).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -958,7 +975,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
