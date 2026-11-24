@@ -1793,7 +1793,8 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // Flag 4: made for unordered access.
+        crate::shadow::register(at, resource.data() as u64, desc.width, desc.flags & 4 != 0);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

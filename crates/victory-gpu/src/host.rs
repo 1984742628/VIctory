@@ -5553,8 +5553,54 @@ impl Host {
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        // On the card while three tenths of its budget are free: upload
+        // memory gives way before copies (`shadow::card_for`) and textures.
+        if self.gpu_upload()
+            && self.video_memory().is_some_and(|[budget, used, ..]| used + size <= budget / 10 * 7)
+            && let Some(made) = self.mapped_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, size)
+        {
+            return Some(made);
+        }
+        self.mapped_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, size)
+    }
+
+    /// Whether the CPU can map the card's own memory (GPU upload heaps:
+    /// Resizable BAR and a driver that offers it); asked once.
+    /// `VICTORY_GPU_UPLOAD=0` keeps upload memory and host copies in the
+    /// PC's memory, as before.
+    pub(crate) fn gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes our structure of the given size.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut options).cast(), size_of_val(&options) as u32)
+            };
+            let supported = asked.is_ok() && options.GPUUploadHeapSupported.as_bool();
+            let on = supported && std::env::var_os("VICTORY_GPU_UPLOAD").is_none_or(|v| v != "0");
+            tracing::info!(supported, on, "host GPU upload heaps");
+            on
+        })
+    }
+
+    /// A buffer in the card's memory that the CPU maps for writing only
+    /// (write-combined: never read through the mapping) and shaders read:
+    /// a host copy with no CPU side. Call only with [`Host::gpu_upload`].
+    pub(crate) fn card_mapped_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
+        self.mapped_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, size)
+    }
+
+    fn mapped_buffer(
+        &self,
+        kind: D3D12_HEAP_TYPE,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: kind,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -5568,6 +5614,7 @@ impl Host {
                 Quality: 0,
             },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -5579,7 +5626,7 @@ impl Host {
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    state,
                     None,
                     &mut buffer,
                 )
@@ -5591,7 +5638,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, on_card = kind == D3D12_HEAP_TYPE_GPU_UPLOAD, "no upload buffer");
                 None
             }
         }
