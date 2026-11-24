@@ -2789,6 +2789,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // Made without the lock, which every recording thread takes; in
+        // place stays under it (`in_place_let_go` must not miss one).
+        let held = (!buffer_unlocked()).then_some(map);
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -2833,9 +2836,26 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
-        entry.shadow = Some(shadow);
+        let mut map = held.unwrap_or_else(buffers);
+        let Some(entry) = map.get_mut(&key).filter(|e| e.end == key.0 + len) else {
+            // Released while its copy was made: asked again.
+            drop(map);
+            return lookup(address, end - address, any);
+        };
+        // The first copy in stays; one made beside it was handed to nothing.
+        let first = entry.shadow.get_or_insert_with(|| shadow.clone()).clone();
+        drop(map);
+        return Some(first);
     }
     entry.shadow.clone()
+}
+
+/// Whether a title buffer's copy is made without the table's lock held
+/// ([`lookup`]). On by default; `VICTORY_BUFFER_UNLOCKED=0` holds it, as
+/// before.
+fn buffer_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_UNLOCKED").is_none_or(|v| v != "0"))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3010,6 +3030,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // Made without the lock, as a buffer's copy is (`lookup`).
+    let held = (!window_unlocked()).then_some(map);
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -3042,9 +3064,20 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    let mut map = held.unwrap_or_else(|| LOOSE.lock().unwrap_or_else(|e| e.into_inner()));
+    // The first copy in stays; one made beside it was handed to nothing.
+    let first = map.entry((start, len)).or_insert_with(|| shadow.clone()).clone();
+    note(&first);
+    drop(map);
+    Some(first)
+}
+
+/// Whether a window's copy is made without the table's lock held
+/// ([`loose`]). On by default; `VICTORY_WINDOW_UNLOCKED=0` holds it, as
+/// before.
+fn window_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UNLOCKED").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]

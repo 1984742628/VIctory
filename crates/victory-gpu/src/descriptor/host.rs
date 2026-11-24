@@ -1258,6 +1258,15 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if for_draw && tag == VIEW_TAG && made[index as usize] != key && slot_warm() {
+            // Host copies are made without the lock: every recording thread
+            // and the submitting one wait on it.
+            drop(made);
+            if let Some(view) = view_at(i, generation) {
+                warm(&view);
+            }
+            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1999,6 +2008,28 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+/// Whether [`HostHeap::mirror`] has the host copy a slot's view needs made
+/// before it takes the heap's lock ([`warm`]). On by default;
+/// `VICTORY_SLOT_WARM=0` makes it under the lock, as before.
+fn slot_warm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_WARM").is_none_or(|v| v != "0"))
+}
+
+/// Has the host resource [`make`] would view for `view` made, if it is not
+/// there yet: `make` then only finds it.
+fn warm(view: &View) {
+    if let Some(view) = placed_texture(view) {
+        return warm(&view);
+    }
+    match view {
+        &View::Constant(address, size) => drop(crate::shadow::find(address, u64::from(size))),
+        View::Shader(r, _) | View::Unordered(r, _, _)
+            if crate::resource::host_resource(*r as crate::object::This).is_some() => {}
+        _ => drop(buffer_extent(view).and_then(|(address, len)| crate::shadow::find(address, len))),
     }
 }
 

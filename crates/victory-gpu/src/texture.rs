@@ -387,7 +387,62 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // No list holds it any more (each is reset only after it has run):
+        // the next texture of its size may write the buffer.
+        let (size, most) = (pool_size(self.bytes), pool_most());
+        if most == 0 {
+            return;
+        }
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.0 + size <= most {
+            pool.0 += size;
+            pool.1.entry(size).or_default().push((self.buffer.clone(), self.data as usize, crate::host::moment()));
+        }
     }
+}
+
+/// Staging buffers of textures let go, kept for the next texture of their
+/// size: their bytes, and by size each buffer, its mapping and when it was
+/// put here ([`let_go_idle`] frees those nothing took).
+#[allow(clippy::type_complexity)]
+static POOL: Mutex<(u64, std::collections::BTreeMap<u64, Vec<(ID3D12Resource, usize, u64)>>)> =
+    Mutex::new((0, std::collections::BTreeMap::new()));
+
+/// The most bytes [`POOL`] keeps: `VICTORY_STAGING_POOL_MB`, 256 unless
+/// set. 0: none, and every texture has a staging buffer made of exactly
+/// its bytes, as before (42,607 upload buffers made in five minutes of run
+/// 60).
+fn pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+    })
+}
+
+/// The size of the staging buffer for `bytes` of subresources: with the
+/// pool, the next multiple of 64 KiB, which the host gives a buffer anyway.
+fn pool_size(bytes: u64) -> u64 {
+    if pool_most() == 0 { bytes } else { bytes.max(1).next_multiple_of(64 << 10) }
+}
+
+/// A mapped staging buffer for `bytes` of subresources: one from [`POOL`],
+/// zeroed as a new one is (a texture not mapped yet uploads it as it is),
+/// or a new one.
+fn staging_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let size = pool_size(bytes);
+    let kept = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = pool.1.get_mut(&size).and_then(Vec::pop);
+        pool.0 -= kept.as_ref().map_or(0, |_| size);
+        kept
+    };
+    let Some((buffer, data, _)) = kept else {
+        return host.upload_buffer(size);
+    };
+    // SAFETY: the buffer's own mapping, at least `bytes` long; nothing else
+    // names the buffer.
+    unsafe { (data as *mut u8).write_bytes(0, bytes as usize) };
+    Some((buffer, data as *mut u8))
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -443,6 +498,22 @@ pub(crate) fn let_go_idle() {
         }
         keep
     });
+    // What the pool kept and no texture took in that time goes too (freed
+    // after the pool's lock, which recording threads take).
+    let idle: Vec<ID3D12Resource> = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (pooled, by_size) = &mut *pool;
+        let mut idle = Vec::new();
+        for (size, kept) in by_size.iter_mut() {
+            // The oldest are first: the newest is taken first and put last.
+            let old = kept.partition_point(|k| crate::host::long_ago(k.2, IDLE_MS, IDLE_FRAMES));
+            *pooled -= size * old as u64;
+            idle.extend(kept.drain(..old).map(|k| k.0));
+        }
+        by_size.retain(|_, kept| !kept.is_empty());
+        idle
+    };
+    drop(idle);
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -981,13 +1052,22 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// Whether a texture's staging state is made without the table's lock held
+/// ([`staging`]). On by default; `VICTORY_STAGING_UNLOCKED=0` holds it, as
+/// before.
+fn staging_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    if let Some(s) = map.get_or_insert_with(HashMap::new).get(&(resource as usize)) {
         return Some(s.clone());
     }
+    // Made without the lock: every list's first use of a texture takes it.
+    let held = (!staging_unlocked()).then_some(map);
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1025,7 +1105,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data) = staging_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1051,8 +1131,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut map = held.unwrap_or_else(|| STAGING.lock().unwrap_or_else(|e| e.into_inner()));
+    // The first one in stays; one made beside it was handed to no list.
+    Some(map.get_or_insert_with(HashMap::new).entry(resource as usize).or_insert(s).clone())
 }
 
 #[cfg(test)]
