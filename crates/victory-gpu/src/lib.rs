@@ -69,3 +69,23 @@ pub use inplace::{
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
 };
+
+/// `base` for a PC of 17-29 GiB; half at 16 GiB or less, twice at 30 GiB or
+/// more (a 32 GB PC reports about 31.8). Pool limits scale by it (fork #47).
+#[cfg(windows)]
+pub(crate) fn by_ram(base: u64) -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static GIB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let gib = *GIB.get_or_init(|| {
+        // SAFETY: plain data the call fills in, its size given.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure of ours.
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 { m.ullTotalPhys >> 30 } else { 24 }
+    });
+    match gib {
+        0..=16 => base / 2,
+        30.. => base * 2,
+        _ => base,
+    }
+}
