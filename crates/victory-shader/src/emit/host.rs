@@ -68,6 +68,16 @@ impl Host {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
+            // refused pipeline's error then carries.
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok()
+                    && let Some(debug) = debug
+                {
+                    debug.EnableDebugLayer();
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             if warp {
                 let factory: IDXGIFactory4 =
@@ -76,6 +86,21 @@ impl Host {
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                    {
+                        return Err("the default device is the software adapter".to_owned());
+                    }
+                }
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -132,21 +157,23 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                ParameterType: match kind {
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    2 => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_CBV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -156,23 +183,6 @@ impl Host {
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            });
-        }
-        // The bounds of stages that read them, last (set by `dispatch` and
-        // `draw`, see `bounds_params`).
-        let mut limits = Vec::new();
-        for &(s, vis) in stages.iter().filter(|(s, _)| s.bounds) {
-            limits.push((params.len() as u32, s.bounds_dwords()));
-            params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Constants: D3D12_ROOT_CONSTANTS {
-                        ShaderRegister: super::BOUNDS_REGISTER,
-                        RegisterSpace: super::USER_DATA_SPACE,
-                        Num32BitValues: s.bounds_dwords(),
-                    },
-                },
-                ShaderVisibility: vis,
             });
         }
         let mut samplers = Vec::new();
@@ -221,13 +231,7 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            let root: ID3D12RootSignature =
-                self.device.CreateRootSignature(0, bytes).map_err(err)?;
-            bounds_params()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(root.as_raw() as usize, limits);
-            Ok(root)
+            self.device.CreateRootSignature(0, bytes).map_err(err)
         }
     }
 
@@ -256,7 +260,34 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+    }
+
+    /// The error with the debug layer's messages since the last call, if
+    /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    fn explained(&self, e: windows::core::Error) -> String {
+        let mut text = err(e);
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return text;
+        };
+        // SAFETY: each message is read into a buffer of the size the queue
+        // asks for, aligned for the message header.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut len = 0usize;
+                let _ = queue.GetMessage(i, None, &mut len);
+                let mut buffer = vec![0u64; len.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut len).is_ok() {
+                    let m = &*message;
+                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
+                    text.push_str(" | ");
+                    text.push_str(&String::from_utf8_lossy(bytes));
+                }
+            }
+            queue.ClearStoredMessages();
+        }
+        text
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -277,6 +308,18 @@ impl Host {
         &self,
         root: &ID3D12RootSignature,
         vs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_with_gs(root, vs, None, ps)
+    }
+
+    /// As [`Host::pipeline_with`], with a geometry shader between the two
+    /// (the rectangle stage, `rect_list_gs`).
+    pub fn pipeline_with_gs(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
@@ -310,6 +353,10 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
+                BytecodeLength: gs.len(),
+            }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -509,12 +556,6 @@ pub fn stub_ps() -> HostShader {
     stub(true, vec![target])
 }
 
-/// A vertex shader writing zeros to `outputs` (tests).
-#[cfg(test)]
-pub(crate) fn stub_vertex(outputs: Vec<SigElement>) -> HostShader {
-    stub(false, outputs)
-}
-
 fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     use super::bitcode::{Attr, Term};
     let mut s = super::shader::Shader::new(pixel);
@@ -557,30 +598,9 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
-        bounds: false,
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
-}
-
-/// Bounds parameters of a root signature: (root parameter, dwords).
-type BoundsParams = Vec<(u32, u32)>;
-
-/// The bounds root parameters of each root signature the harness made (by
-/// its address): [`HostShader::bounds`] stages read them.
-fn bounds_params() -> &'static std::sync::Mutex<std::collections::HashMap<usize, BoundsParams>> {
-    static PARAMS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, BoundsParams>>> =
-        std::sync::OnceLock::new();
-    PARAMS.get_or_init(Default::default)
-}
-
-/// The bounds parameters of `root` (none for a signature made elsewhere).
-#[cfg(test)]
-fn bounds_of(root: &ID3D12RootSignature) -> BoundsParams {
-    bounds_params()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(root.as_raw() as usize))
-        .cloned()
-        .unwrap_or_default()
 }
 
 /// A root argument for [`Host::draw`].
@@ -817,11 +837,6 @@ impl Host {
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
-            for (param, dwords) in bounds_of(root) {
-                let mut values = vec![0u32; dwords as usize];
-                values[0] = d.textures.len().max(1) as u32;
-                list.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -1347,12 +1362,6 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
-            // The heap's size; root SRV lengths unset (0: unbounded).
-            for (param, dwords) in bounds_of(root) {
-                let mut values = vec![0u32; dwords as usize];
-                values[0] = d.views.len().max(1) as u32;
-                list.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
