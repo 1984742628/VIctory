@@ -249,7 +249,21 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
+///
+/// R9G9B9E5_SHAREDEXP (67), which PC D3D12 never allows as a render target
+/// or unordered access, is R16G16B16A16_FLOAT (10) on every host (PR #492):
+/// half floats hold every RGB9E5 value's range, with 10 bits of mantissa
+/// for its 9. In Series S mode the title asks for its FidelityFX upscale
+/// output in RGB9E5 with both uses; made in that format, the texture was
+/// refused and its render target view removed the device.
+/// shortcut: a view of the stand-in reads the alpha written there, where
+/// RGB9E5 reads 1 (PR #492 forced it to 1 in the view's mapping).
 pub(crate) fn target_format(format: u32) -> u32 {
+    const R9G9B9E5_SHAREDEXP: u32 = 67;
+    const R16G16B16A16_FLOAT: u32 = 10;
+    if format == R9G9B9E5_SHAREDEXP {
+        return R16G16B16A16_FLOAT;
+    }
     const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
@@ -2253,6 +2267,35 @@ mod tests {
         creation_nodes: 0,
         visible_nodes: 0,
     };
+
+    #[test]
+    fn rgb9e5_targets_are_half_float_rgba() {
+        // R9G9B9E5_SHAREDEXP -> R16G16B16A16_FLOAT, on every host.
+        assert_eq!(target_format(67), 10);
+        // Formats the host renders to stay their own.
+        assert_eq!(target_format(10), 10);
+        assert_eq!(target_format(28), 28);
+    }
+
+    /// The title's Series S FidelityFX output: RGB9E5 with render target
+    /// and unordered access (flags 5). Made as is, the host refused it and
+    /// its render target view removed the device.
+    #[test]
+    fn an_rgb9e5_target_gets_a_host_texture() {
+        if crate::host::host().is_none() {
+            eprintln!("skipping: no D3D12 device");
+            return;
+        }
+        let mut desc = buffer(1920);
+        desc.dimension = 3;
+        desc.height = 1080;
+        desc.mip_levels = 1;
+        desc.format = 67;
+        desc.flags = 5;
+        let texture = host_texture(&desc, 0, std::ptr::null()).expect("a host texture");
+        // SAFETY: a live resource.
+        assert_eq!(unsafe { texture.GetDesc() }.Format.0, 10);
+    }
 
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {

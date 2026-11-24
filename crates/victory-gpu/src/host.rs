@@ -6912,7 +6912,7 @@ mod present_plane_tests {
                     .unwrap();
                 let texture = texture.unwrap();
                 list.list
-                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+                    .ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
                 texture
             }
         };
