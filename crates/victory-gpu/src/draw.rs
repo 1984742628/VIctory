@@ -2014,6 +2014,18 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // As `root_view`: bound from its copy where one holds it
+                        // aligned, with no fill that would wait for shader writes.
+                        let aligned = u64::from(size.next_multiple_of(256));
+                        if let Some(shadow) = (aligned > 0 && aligned <= 1 << 16)
+                            .then(|| crate::shadow::find(address, aligned))
+                            .flatten()
+                            .filter(|s| s.gpu(address) % 256 == 0 && s.left(address) >= aligned)
+                        {
+                            shadow.refresh(list, address, aligned);
+                            host.constant_at(index, shadow.gpu(address), size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
