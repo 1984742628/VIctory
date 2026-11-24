@@ -709,6 +709,42 @@ mod tests {
         }
     }
 
+    /// In a view the runtime told us of, copies are plain: they see what the
+    /// kernel's would, and a write to a guarded block opens it.
+    #[test]
+    fn copies_in_told_views_are_plain() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 2 << 16;
+        // SAFETY: a pagefile section of two blocks, mapped read-write and
+        // unmapped at the end.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, N as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, N).Value.cast::<u8>();
+            assert!(!view.is_null());
+            assert!(super::in_views(&[(view as usize, N)]).is_none());
+            crate::inplace::title_memory_view(view as usize, N, section as usize, 0);
+            assert!(super::in_views(&[(view as usize + 5, N - 5)]).is_some());
+            assert!(super::in_views(&[(view as usize, N + 1)]).is_none());
+            view.write_bytes(7, N);
+            let mut out = vec![0u8; N];
+            super::copy_mapped(out.as_mut_ptr(), view, N, false);
+            assert!(out.iter().all(|&v| v == 7));
+            // Guarded (read-only) now; our write goes through the handler.
+            let (_, first) = crate::watch::writes(view as usize, view as usize + N, true).expect("a view");
+            assert_eq!(first.len(), 2);
+            super::write_mapped(view.add(70_000), [9u8; 16].as_ptr(), 16);
+            let mut back = [0u8; 16];
+            assert!(super::read_into(view.add(70_000), &mut back));
+            assert_eq!(back, [9; 16]);
+            let (now, written) = crate::watch::writes(view as usize, view as usize + N, true).expect("a view");
+            assert_eq!(written.iter().filter(|w| w.1 == now).count(), 1);
+            crate::watch::title_memory_remapped(view as usize, N);
+            assert!(super::in_views(&[(view as usize, N)]).is_none());
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -5330,6 +5366,28 @@ impl Batch {
     }
 }
 
+/// For a plain copy from or to title memory, not through the kernel (3.9
+/// GB/s in, 1 GB/s out, and a call each): `Some` while every one of
+/// `ranges` (address, bytes) lies in views the runtime told us of, which
+/// are mapped and committed and stay so until what comes back is dropped
+/// (`crate::watch::title_memory_reading`); a write to a guarded block of
+/// theirs opens it in our handler. Anything else (the title's own
+/// allocations, which it may free under us; a mapping being changed) is
+/// `None`: through the kernel, as before.
+/// `VICTORY_PLAIN_COPIES=0`: always `None`.
+fn in_views(ranges: &[(usize, usize)]) -> Option<crate::watch::Reading> {
+    use crate::inplace::Cover;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLAIN_COPIES").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let reading = crate::watch::title_memory_reading_now()?;
+    ranges
+        .iter()
+        .all(|&(at, len)| matches!(crate::inplace::cover(at, len), Cover::Run(..) | Cover::Scattered))
+        .then_some(reading)
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -5372,7 +5430,20 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let plain = if title_dst {
+        in_views(&[(src as usize, len), (dst as usize, len)])
+    } else {
+        in_views(&[(src as usize, len)])
+    };
+    let whole = match plain {
+        Some(_mapped) => {
+            // SAFETY: title memory at either end is mapped while `_mapped`
+            // is held (`in_views`); a host destination is the caller's.
+            unsafe { std::ptr::copy(src, dst, len) };
+            true
+        }
+        None => read(src, dst, len),
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5452,6 +5523,11 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    if let Some(_mapped) = in_views(&[(src as usize, dst.len())]) {
+        // SAFETY: the source is mapped while `_mapped` is held (`in_views`).
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
+        return true;
+    }
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -5496,6 +5572,12 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if let Some(_mapped) = in_views(&[(dst as usize, len)]) {
+        // SAFETY: the destination is mapped while `_mapped` is held
+        // (`in_views`); the source is our mapped host memory.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
