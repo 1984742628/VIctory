@@ -228,7 +228,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; 1024 by default, 0 none).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -244,11 +244,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// (`card_for`): textures keep their room, and once they have filled the
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
-/// alone; what moves is what shaders read.
+/// alone; what moves is what shaders read. (With [`direct_for`] there is
+/// no CPU side, and it does shrink.)
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
