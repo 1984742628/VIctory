@@ -981,13 +981,22 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// Whether a texture's staging state is made without the table's lock held
+/// ([`staging`]). On by default; `VICTORY_STAGING_UNLOCKED=0` holds it, as
+/// before.
+fn staging_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    if let Some(s) = map.get_or_insert_with(HashMap::new).get(&(resource as usize)) {
         return Some(s.clone());
     }
+    // Made without the lock: every list's first use of a texture takes it.
+    let held = (!staging_unlocked()).then_some(map);
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1051,8 +1060,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut map = held.unwrap_or_else(|| STAGING.lock().unwrap_or_else(|e| e.into_inner()));
+    // The first one in stays; one made beside it was handed to no list.
+    Some(map.get_or_insert_with(HashMap::new).entry(resource as usize).or_insert(s).clone())
 }
 
 #[cfg(test)]
